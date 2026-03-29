@@ -507,7 +507,9 @@ import math
 import numpy as np
 import torch
 import torch.optim as optim
-from torch.cuda.amp import GradScaler, autocast
+# from torch.cuda.amp import GradScaler, autocast
+from torch.cuda.amp import GradScaler
+from torch.amp import autocast
 
 from TCNM.data.loader import data_loader
 from TCNM.flow_matching_model import TCFlowMatching
@@ -774,7 +776,7 @@ def main(args):
         for i, batch in enumerate(train_loader):
             bl = move(list(batch), device)
 
-            with autocast(enabled=args.use_amp):
+            with autocast("cuda", enabled=args.use_amp):
                 bd = model.get_loss_breakdown(bl)
 
             scaler.scale(bd["total"] / max(args.grad_accum, 1)).backward()
@@ -782,10 +784,10 @@ def main(args):
             if (i + 1) % max(args.grad_accum, 1) == 0:
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-                scaler.step(optimizer)
+                scaler.step(optimizer)   # ← optimizer.step() TRƯỚC
                 scaler.update()
+                scheduler.step()         # ← scheduler.step() SAU
                 optimizer.zero_grad()
-                scheduler.step()
 
             sum_loss += bd["total"].item()
             for k in sum_parts:
