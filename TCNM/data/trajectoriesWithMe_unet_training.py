@@ -1275,7 +1275,6 @@ Env:    90-dim feature vector.
 
 Data1d file format (TCND_VN .txt):
   col0  row_id    (float, used as frame id)
-  col1  ped_id    (float, 1.0)
   col2  lon_norm  = (lon_01E − 1800) / 50
   col3  lat_norm  = lat_01N / 50
   col4  pres_norm = (pres_hPa − 960) / 50
@@ -1711,23 +1710,71 @@ class TrajectoryDataset(Dataset):
     def _read_file(self, path: str, delim: str) -> dict:
         """
         Read Data1d .txt file.
-        Format per line: row_id ped_id lon_norm lat_norm pres_norm wind_norm ... date name
-        Last two columns are date and name (kept in 'addition').
+        
+        Format:
+        Row 1 : header  (ID LONG LAT PRES WND YYYYMMDDHH Name)
+        Row 2 : dashes  (--- --- ---)
+        Row 3+: data    (39 -9.2800 2.5000 0.8400 -1.0800 2022102600 MERBOK)
+        
+        Columns:
+        col0 = ID         (int, used as frame_id)
+        col1 = LONG_norm  (float, already normalised)
+        col2 = LAT_norm   (float, already normalised)
+        col3 = PRES_norm  (float, already normalised)
+        col4 = WND_norm   (float, already normalised)
+        col5 = date       (YYYYMMDDHH)
+        col6 = name       (storm name)
         """
         data, add = [], []
-        with open(path) as f:
-            for line in f:
-                p = line.strip().split(delim)
-                if len(p) < 5:
-                    continue
-                add.append(p[-2:])   # [date, name]
-                nums = [
-                    1.0 if i == 1   # ped_id always 1
-                    else (float(v) if v.lower() not in ("null", "nan", "") else 0.0)
-                    for i, v in enumerate(p[:-2])
-                ]
-                data.append(nums)
-        return {"main": np.asarray(data, dtype=np.float32), "addition": add}
+
+        with open(path, encoding="utf-8", errors="ignore") as f:
+            raw_lines = f.readlines()
+
+        for line in raw_lines:
+            line = line.strip()
+
+            # Skip empty, comments, dashes separator, header
+            if not line:
+                continue
+            if line.startswith("#") or line.startswith("//"):
+                continue
+            if line.startswith("-") or line.startswith("="):
+                continue  # dashes separator row
+
+            # Split on whitespace (handles multiple spaces)
+            parts = line.split()
+
+            # Cần ít nhất 7 cột: ID LONG LAT PRES WND DATE NAME
+            if len(parts) < 7:
+                continue
+
+            # Skip header row: col0 phải là số nguyên (ID)
+            try:
+                int(parts[0])
+            except ValueError:
+                continue  # là header hoặc dòng chữ
+
+            # Parse
+            try:
+                frame_id  = float(parts[0])   # ID → frame id
+                ped_id    = 1.0               # luôn là 1 (single TC)
+                lon_norm  = float(parts[1])   # LONG_norm
+                lat_norm  = float(parts[2])   # LAT_norm
+                pres_norm = float(parts[3])   # PRES_norm
+                wnd_norm  = float(parts[4])   # WND_norm
+                date      = parts[5]          # YYYYMMDDHH
+                name      = parts[6]          # storm name
+
+                add.append([date, name])
+                data.append([frame_id, ped_id, lon_norm, lat_norm, pres_norm, wnd_norm])
+
+            except (ValueError, IndexError):
+                continue
+
+        return {
+            "main":     np.asarray(data, dtype=np.float32) if data else np.zeros((0, 6), dtype=np.float32),
+            "addition": add,
+        }
 
     def _poly_fit(self, traj: np.ndarray, tlen: int, threshold: float) -> float:
         """Non-linearity score via 2nd-order polynomial residual."""
