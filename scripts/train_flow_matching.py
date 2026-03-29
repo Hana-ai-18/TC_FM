@@ -534,7 +534,7 @@ def get_args():
     p.add_argument("--dataset_root",    default="TCND_vn",  type=str)
     p.add_argument("--obs_len",         default=8,          type=int)
     p.add_argument("--pred_len",        default=12,         type=int)
-    p.add_argument("--test_year",       default=2019,       type=int)
+    p.add_argument("--test_year",       default=None,       type=int)
     # Training
     p.add_argument("--batch_size",      default=32,         type=int)
     p.add_argument("--num_epochs",      default=200,        type=int)
@@ -709,23 +709,25 @@ def main(args):
     print(f"  num_workers  : {args.num_workers}")
 
     # ── Data ──────────────────────────────────────────────────────────────
+    # ── Data ──────────────────────────────────────────────────────────────
     _, train_loader = data_loader(
         args, {"root": args.dataset_root, "type": "train"}, test=False)
-    _, val_loader   = data_loader(
-        args, {"root": args.dataset_root, "type": "val"}, test=True)
+    
+    _, val_loader = data_loader(
+        args, {"root": args.dataset_root, "type": "val"}, test=True)  # ← luôn dùng val/
 
     test_loader = None
     try:
         _, test_loader = data_loader(
             args, {"root": args.dataset_root, "type": "test"},
-            test=True, test_year=args.test_year)
+            test=True, test_year=None)   # ← None: lấy toàn bộ test/
     except Exception as e:
         print(f"  Warning: test loader failed: {e}")
 
     print(f"  train : {len(train_loader.dataset)} seq")
     print(f"  val   : {len(val_loader.dataset)} seq")
     if test_loader:
-        print(f"  test  : {len(test_loader.dataset)} seq  (year={args.test_year})")
+        print(f"  test  : {len(test_loader.dataset)} seq ")
 
     # ── Model ──────────────────────────────────────────────────────────────
     model = TCFlowMatching(
