@@ -1266,14 +1266,15 @@
 #         ]
 
 """
-TCNM/data/trajectoriesWithMe_unet_training.py  ── v9
-======================================================
+TCNM/data/trajectoriesWithMe_unet_training.py  ── v9-fixed
+==============================================================
 TC trajectory dataset — TRAINING VERSION.
+
 Data3d: 81×81×13 tensor (GPH×4 + U×4 + V×4 + SST×1 at 200/500/850/925 hPa).
 Env:    90-dim feature vector.
 
 Data1d file format (TCND_VN .txt):
-  col0  row_id    (float)
+  col0  row_id    (float, used as frame id)
   col1  ped_id    (float, 1.0)
   col2  lon_norm  = (lon_01E − 1800) / 50
   col3  lat_norm  = lat_01N / 50
@@ -1288,6 +1289,21 @@ Data3d file: WP{year}{name}_{timestamp}.npy  → shape (81,81,13) or (13,81,81)
     4–7   U    @200, 500, 850, 925 hPa
     8–11  V    @200, 500, 850, 925 hPa
     12    SST  (surface)
+
+Global normalization stats (computed from aligned_data.csv):
+  GPH200: mean=12439.46  std=91.59
+  GPH500: mean= 5843.14  std=50.55
+  GPH850: mean= 1482.47  std=29.42
+  GPH925: mean=  752.80  std=28.49
+  U200:   mean=   -0.52  std= 8.97
+  U500:   mean=    0.27  std= 4.73
+  U850:   mean=   -0.34  std= 2.98
+  U925:   mean=   -0.86  std= 2.75
+  V200:   mean=    0.25  std= 5.37
+  V500:   mean=    1.76  std= 2.29
+  V850:   mean=    1.34  std= 2.21
+  V925:   mean=    0.94  std= 2.68
+  SST:    mean=  300.95  std= 3.05
 """
 from __future__ import annotations
 
@@ -1325,18 +1341,52 @@ from TCNM.env_net_transformer_gphsplit import (
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Data3d constants
+# ── Data3d constants ──────────────────────────────────────────────────────────
 DATA3D_H  = 81
 DATA3D_W  = 81
-DATA3D_CH = 13   # GPH×4 + U×4 + V×4 + SST×1
+DATA3D_CH = 13  # GPH×4 + U×4 + V×4 + SST×1
+
+# Global z-score normalization for Data3d channels
+# Computed from aligned_data.csv using physically valid value ranges
+DATA3D_MEAN = np.array([
+    12439.46,  # GPH @200 hPa (m)
+     5843.14,  # GPH @500 hPa (m)
+     1482.47,  # GPH @850 hPa (m)
+      752.80,  # GPH @925 hPa (m)
+       -0.52,  # U   @200 hPa (m/s)
+        0.27,  # U   @500 hPa (m/s)
+       -0.34,  # U   @850 hPa (m/s)
+       -0.86,  # U   @925 hPa (m/s)
+        0.25,  # V   @200 hPa (m/s)
+        1.76,  # V   @500 hPa (m/s)
+        1.34,  # V   @850 hPa (m/s)
+        0.94,  # V   @925 hPa (m/s)
+      300.95,  # SST (K)
+], dtype=np.float32)
+
+DATA3D_STD = np.array([
+    91.59,   # GPH @200 hPa
+    50.55,   # GPH @500 hPa
+    29.42,   # GPH @850 hPa
+    28.49,   # GPH @925 hPa
+     8.97,   # U   @200 hPa
+     4.73,   # U   @500 hPa
+     2.98,   # U   @850 hPa
+     2.75,   # U   @925 hPa
+     5.37,   # V   @200 hPa
+     2.29,   # V   @500 hPa
+     2.21,   # V   @850 hPa
+     2.68,   # V   @925 hPa
+     3.05,   # SST
+], dtype=np.float32)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  env_data_processing  (exported — shared with inference dataset)
+#  env_data_processing
 # ══════════════════════════════════════════════════════════════════════════════
 
 def env_data_processing(env_dict: dict) -> dict:
-    """Replace sentinel −1 with 0.0, keep arrays intact."""
+    """Replace sentinel −1 with 0.0 for scalar fields; keep arrays intact."""
     if not isinstance(env_dict, dict):
         return {}
     cleaned = {}
@@ -1356,33 +1406,41 @@ def seq_collate(data):
     """
     Collate list of dataset items into batch tensors.
 
-    Input item layout (16 elements per item):
-      0  obs_traj   [n_ped, 2, T_obs]
-      1  pred_traj  [n_ped, 2, T_pred]
-      2  obs_rel    [n_ped, 2, T_obs]
-      3  pred_rel   [n_ped, 2, T_pred]
-      4  nlp        list[float]
-      5  mask       [n_ped, seq_len]
-      6  obs_Me     [n_ped, 2, T_obs]
-      7  pred_Me    [n_ped, 2, T_pred]
-      8  obs_Me_rel [n_ped, 2, T_obs]
-      9  pred_Me_rel[n_ped, 2, T_pred]
-      10 obs_date   embed [1,4,T_obs]
-      11 pred_date  embed [1,4,T_pred]
-      12 img_obs    [T_obs, 81, 81, 13]   ← 13-channel Data3d
-      13 img_pred   [T_pred, 81, 81, 13]
-      14 env_data   dict of tensors [T_obs, dim]
-      15 tyID       dict
+    Input item layout (16 elements):
+      0  obs_traj     [n_ped, 2, T_obs]
+      1  pred_traj    [n_ped, 2, T_pred]
+      2  obs_rel      [n_ped, 2, T_obs]
+      3  pred_rel     [n_ped, 2, T_pred]
+      4  nlp          list[float]
+      5  mask         [n_ped, seq_len]
+      6  obs_Me       [n_ped, 2, T_obs]
+      7  pred_Me      [n_ped, 2, T_pred]
+      8  obs_Me_rel   [n_ped, 2, T_obs]
+      9  pred_Me_rel  [n_ped, 2, T_pred]
+      10 obs_date     embed [1,4,T_obs]
+      11 pred_date    embed [1,4,T_pred]
+      12 img_obs      [T_obs, 81, 81, 13]
+      13 img_pred     [T_pred, 81, 81, 13]
+      14 env_data     dict of tensors [T_obs, dim]
+      15 tyID         dict
 
-    Batch outputs:
+    Batch outputs (indices match model batch_list access):
       0  obs_traj   [T_obs, B, 2]
       1  pred_traj  [T_pred, B, 2]
+      2  obs_rel    [T_obs, B, 2]
+      3  pred_rel   [T_pred, B, 2]
+      4  nlp        tensor
+      5  mask       [seq_len, B]
+      6  seq_start_end [B, 2]
       7  obs_Me     [T_obs, B, 2]
       8  pred_Me    [T_pred, B, 2]
-      11 img_obs    [B, 13, T_obs, 81, 81]  ← channel-first for UNet3D
+      9  obs_Me_rel [T_obs, B, 2]
+      10 pred_Me_rel[T_pred, B, 2]
+      11 img_obs    [B, 13, T_obs, 81, 81]
       12 img_pred   [B, 13, T_pred, 81, 81]
-      13 env_data   dict — each key: [B, T, dim]
-      15 tyID       list[dict]
+      13 env_data   dict — each key [B, T, dim]
+      14 None
+      15 list[dict]
     """
     (obs_traj, pred_traj, obs_rel, pred_rel,
      nlp, mask,
@@ -1392,8 +1450,9 @@ def seq_collate(data):
      env_data_raw, tyID) = zip(*data)
 
     def traj_TBC(lst):
-        cat = torch.cat(lst, dim=0)      # [total_ped, 2, T]
-        return cat.permute(2, 0, 1)      # [T, total_ped, 2]
+        """Stack list of [n_ped, 2, T] → [T, total_ped, 2]."""
+        cat = torch.cat(lst, dim=0)   # [total_ped, 2, T]
+        return cat.permute(2, 0, 1)   # [T, total_ped, 2]
 
     obs_traj_out    = traj_TBC(obs_traj)
     pred_traj_out   = traj_TBC(pred_traj)
@@ -1404,25 +1463,25 @@ def seq_collate(data):
     obs_Me_rel_out  = traj_TBC(obs_Me_rel)
     pred_Me_rel_out = traj_TBC(pred_Me_rel)
 
-    nlp_out  = torch.tensor(
+    nlp_out = torch.tensor(
         [v for sl in nlp for v in (sl if hasattr(sl, "__iter__") else [sl])],
         dtype=torch.float,
     )
-    mask_out = torch.cat(list(mask), dim=0).permute(1, 0)
+    mask_out = torch.cat(list(mask), dim=0).permute(1, 0)  # [seq_len, B]
 
-    counts = torch.tensor([t.shape[0] for t in obs_traj])
-    cum    = torch.cumsum(counts, dim=0)
-    starts = torch.cat([torch.tensor([0]), cum[:-1]])
-    seq_start_end = torch.stack([starts, cum], dim=1)
+    # seq_start_end: cumulative ped counts per scene
+    counts        = torch.tensor([t.shape[0] for t in obs_traj])
+    cum           = torch.cumsum(counts, dim=0)
+    starts        = torch.cat([torch.tensor([0]), cum[:-1]])
+    seq_start_end = torch.stack([starts, cum], dim=1)  # [B, 2]
 
     # Images: [T, 81, 81, 13] → [B, 13, T, 81, 81] for 3D-UNet
-    # permute: (0,1,2,3) → batch,T,H,W,C → batch,C,T,H,W
-    img_obs_out  = torch.stack(list(img_obs),  dim=0)          # [B,T,81,81,13]
-    img_obs_out  = img_obs_out.permute(0, 4, 1, 2, 3).float()  # [B,13,T,81,81]
+    img_obs_out  = torch.stack(list(img_obs), dim=0)           # [B, T, 81, 81, 13]
+    img_obs_out  = img_obs_out.permute(0, 4, 1, 2, 3).float()  # [B, 13, T, 81, 81]
     img_pred_out = torch.stack(list(img_pred), dim=0)
     img_pred_out = img_pred_out.permute(0, 4, 1, 2, 3).float()
 
-    # env_data: merge → each key [B, T, dim]
+    # env_data: merge dicts → each key [B, T, dim]
     B = len(env_data_raw)
     env_out: dict | None = None
     valid_envs = [d for d in env_data_raw if isinstance(d, dict)]
@@ -1439,6 +1498,7 @@ def seq_collate(data):
                     v = torch.tensor(v, dtype=torch.float) if not torch.is_tensor(v) else v.float()
                     vals.append(v)
                 else:
+                    # Use zeros shaped like the reference tensor
                     ref = next((d[key] for d in valid_envs if key in d), None)
                     if ref is not None:
                         rt = torch.tensor(ref, dtype=torch.float) if not torch.is_tensor(ref) else ref.float()
@@ -1446,7 +1506,7 @@ def seq_collate(data):
                     else:
                         vals.append(torch.zeros(1))
             try:
-                env_out[key] = torch.stack(vals, dim=0)   # [B, T, dim]
+                env_out[key] = torch.stack(vals, dim=0)  # [B, T, dim]
             except Exception:
                 try:
                     mx = max(v.numel() for v in vals)
@@ -1456,22 +1516,22 @@ def seq_collate(data):
                     pass
 
     return (
-        obs_traj_out,       # 0  [T_obs, B, 2]
-        pred_traj_out,      # 1  [T_pred, B, 2]
-        obs_rel_out,        # 2
-        pred_rel_out,       # 3
-        nlp_out,            # 4
-        mask_out,           # 5
-        seq_start_end,      # 6
-        obs_Me_out,         # 7  [T_obs, B, 2]
-        pred_Me_out,        # 8  [T_pred, B, 2]
-        obs_Me_rel_out,     # 9
-        pred_Me_rel_out,    # 10
-        img_obs_out,        # 11 [B, 13, T_obs, 81, 81]
-        img_pred_out,       # 12 [B, 13, T_pred, 81, 81]
-        env_out,            # 13 dict
-        None,               # 14
-        list(tyID),         # 15
+        obs_traj_out,        # 0  [T_obs, B, 2]
+        pred_traj_out,       # 1  [T_pred, B, 2]
+        obs_rel_out,         # 2  [T_obs, B, 2]
+        pred_rel_out,        # 3  [T_pred, B, 2]
+        nlp_out,             # 4
+        mask_out,            # 5  [seq_len, B]
+        seq_start_end,       # 6  [B, 2]
+        obs_Me_out,          # 7  [T_obs, B, 2]
+        pred_Me_out,         # 8  [T_pred, B, 2]
+        obs_Me_rel_out,      # 9  [T_obs, B, 2]
+        pred_Me_rel_out,     # 10 [T_pred, B, 2]
+        img_obs_out,         # 11 [B, 13, T_obs, 81, 81]
+        img_pred_out,        # 12 [B, 13, T_pred, 81, 81]
+        env_out,             # 13 dict
+        None,                # 14
+        list(tyID),          # 15
     )
 
 
@@ -1483,14 +1543,11 @@ class TrajectoryDataset(Dataset):
     """
     TC trajectory dataset for TCND_VN.
 
-    Data3d: numpy arrays shaped (81,81,13) or (13,81,81) per timestep.
-    Loaded from Data3d/{year}/{name}/WP{year}{name}_{timestamp}.npy
-
-    Directory tree:
+    Directory tree expected:
       <root>/
         Data1d/train|val|test/*.txt
-        Data3d/{year}/{name}/*.npy (or .nc)
-        ENV_DATA/{year}/{name}/*.npy
+        Data3d/{year}/{name}/WP{year}{name}_{timestamp}.npy
+        Env_data/{year}/{name}/{timestamp}.npy
     """
 
     def __init__(
@@ -1531,10 +1588,18 @@ class TrajectoryDataset(Dataset):
 
         self.data1d_path = os.path.join(self.root_path, "Data1d", dtype)
         self.data3d_path = os.path.join(self.root_path, "Data3d")
-        self.env_path    = os.path.join(self.root_path, "ENV_DATA")
+        # Support both "Env_data" (as seen in filesystem) and "ENV_DATA" (legacy)
+        for env_name in ("Env_data", "ENV_DATA", "env_data"):
+            candidate = os.path.join(self.root_path, env_name)
+            if os.path.exists(candidate):
+                self.env_path = candidate
+                break
+        else:
+            self.env_path = os.path.join(self.root_path, "Env_data")
 
         logger.info(f"root ({dtype}) : {self.root_path}")
         logger.info(f"Data1d        : {self.data1d_path}")
+        logger.info(f"Env_data      : {self.env_path}")
 
         self.obs_len    = obs_len
         self.pred_len   = pred_len
@@ -1557,19 +1622,22 @@ class TrajectoryDataset(Dataset):
         ]
         logger.info(f"{len(all_files)} Data1d files (year={test_year})")
 
-        self.obs_traj_raw   = []
-        self.pred_traj_raw  = []
-        self.obs_Me_raw     = []
-        self.pred_Me_raw    = []
-        self.obs_rel_raw    = []
-        self.pred_rel_raw   = []
-        self.non_linear_ped = []
-        self.tyID           = []
-        num_peds_in_seq     = []
+        # Raw storage — appended per-pedestrian
+        self.obs_traj_raw    = []
+        self.pred_traj_raw   = []
+        self.obs_Me_raw      = []
+        self.pred_Me_raw     = []
+        self.obs_rel_raw     = []
+        self.pred_rel_raw    = []
+        self.obs_Me_rel_raw  = []
+        self.pred_Me_rel_raw = []
+        self.non_linear_ped  = []
+        self.tyID            = []
+        num_peds_in_seq      = []
 
         for path in all_files:
-            base   = os.path.splitext(os.path.basename(path))[0]
-            parts  = base.split("_")
+            base  = os.path.splitext(os.path.basename(path))[0]
+            parts = base.split("_")
             f_year = parts[0] if parts else "unknown"
             f_name = parts[1] if len(parts) > 1 else base
 
@@ -1594,24 +1662,36 @@ class TrajectoryDataset(Dataset):
                     ps = seg[seg[:, 1] == pid]
                     if len(ps) != self.seq_len:
                         continue
-                    ps  = np.transpose(ps[:, 2:])   # [4, seq_len]
-                    rel = np.zeros_like(ps)
-                    rel[:, 1:] = ps[:, 1:] - ps[:, :-1]
 
+                    # ps[:, 2:] has columns: [lon_norm, lat_norm, pres_norm, wind_norm]
+                    ps_t = np.transpose(ps[:, 2:])  # [4, seq_len]
+
+                    # Displacement (relative) for ALL 4 channels
+                    rel = np.zeros_like(ps_t)
+                    rel[:, 1:] = ps_t[:, 1:] - ps_t[:, :-1]
+
+                    # Traj = [lon_norm, lat_norm] — cols 0,1
                     self.obs_traj_raw.append(
-                        torch.from_numpy(ps[:2, :obs_len]).float())
+                        torch.from_numpy(ps_t[:2, :obs_len]).float())
                     self.pred_traj_raw.append(
-                        torch.from_numpy(ps[:2, obs_len:]).float())
-                    self.obs_Me_raw.append(
-                        torch.from_numpy(ps[2:, :obs_len]).float())
-                    self.pred_Me_raw.append(
-                        torch.from_numpy(ps[2:, obs_len:]).float())
+                        torch.from_numpy(ps_t[:2, obs_len:]).float())
                     self.obs_rel_raw.append(
                         torch.from_numpy(rel[:2, :obs_len]).float())
                     self.pred_rel_raw.append(
                         torch.from_numpy(rel[:2, obs_len:]).float())
+
+                    # Me = [pres_norm, wind_norm] — cols 2,3
+                    self.obs_Me_raw.append(
+                        torch.from_numpy(ps_t[2:, :obs_len]).float())
+                    self.pred_Me_raw.append(
+                        torch.from_numpy(ps_t[2:, obs_len:]).float())
+                    self.obs_Me_rel_raw.append(
+                        torch.from_numpy(rel[2:, :obs_len]).float())
+                    self.pred_Me_rel_raw.append(
+                        torch.from_numpy(rel[2:, obs_len:]).float())
+
                     self.non_linear_ped.append(
-                        self._poly_fit(ps, pred_len, threshold))
+                        self._poly_fit(ps_t, pred_len, threshold))
                     cnt += 1
 
                 if cnt >= min_ped:
@@ -1624,36 +1704,52 @@ class TrajectoryDataset(Dataset):
         self.num_seq = len(self.tyID)
         cum = np.cumsum(num_peds_in_seq).tolist()
         self.seq_start_end = list(zip([0] + cum[:-1], cum))
-        logger.info(f"✅ {self.num_seq} sequences loaded")
+        logger.info(f"Loaded {self.num_seq} sequences")
 
     # ── File I/O ──────────────────────────────────────────────────────────
 
     def _read_file(self, path: str, delim: str) -> dict:
+        """
+        Read Data1d .txt file.
+        Format per line: row_id ped_id lon_norm lat_norm pres_norm wind_norm ... date name
+        Last two columns are date and name (kept in 'addition').
+        """
         data, add = [], []
         with open(path) as f:
             for line in f:
                 p = line.strip().split(delim)
                 if len(p) < 5:
                     continue
-                add.append(p[-2:])
+                add.append(p[-2:])   # [date, name]
                 nums = [
-                    1.0 if i == 1
+                    1.0 if i == 1   # ped_id always 1
                     else (float(v) if v.lower() not in ("null", "nan", "") else 0.0)
                     for i, v in enumerate(p[:-2])
                 ]
                 data.append(nums)
-        return {"main": np.asarray(data), "addition": add}
+        return {"main": np.asarray(data, dtype=np.float32), "addition": add}
 
-    def _poly_fit(self, traj, tlen, threshold):
+    def _poly_fit(self, traj: np.ndarray, tlen: int, threshold: float) -> float:
+        """Non-linearity score via 2nd-order polynomial residual."""
         t  = np.linspace(0, tlen - 1, tlen)
         rx = np.polyfit(t, traj[0, -tlen:], 2, full=True)[1]
         ry = np.polyfit(t, traj[1, -tlen:], 2, full=True)[1]
         return 1.0 if (len(rx) > 0 and rx[0] + ry[0] >= threshold) else 0.0
 
-    # ── Data3d loading  (81×81×13) ────────────────────────────────────────
+    # ── Data3d loading ────────────────────────────────────────────────────
+
+    def _normalize_data3d(self, arr: np.ndarray) -> np.ndarray:
+        """
+        Apply global z-score normalization to Data3d channels.
+        arr: (81, 81, 13) float32
+        Returns: (81, 81, 13) float32, each channel z-scored, clipped to [-5, 5].
+        """
+        for c in range(DATA3D_CH):
+            arr[:, :, c] = (arr[:, :, c] - DATA3D_MEAN[c]) / (DATA3D_STD[c] + 1e-6)
+        return np.clip(arr, -5.0, 5.0)
 
     def _load_data3d_file(self, path: str) -> np.ndarray | None:
-        """Load one Data3d file → (81,81,13) float32 normalised."""
+        """Load one Data3d file → (81, 81, 13) float32, z-score normalised."""
         try:
             if path.endswith(".npy"):
                 arr = np.load(path).astype(np.float32)
@@ -1666,23 +1762,23 @@ class TrajectoryDataset(Dataset):
 
             # Normalise shape → (H, W, C) = (81, 81, 13)
             if arr.ndim == 2:
-                arr = arr[:, :, np.newaxis]          # (H,W) → (H,W,1)
+                arr = arr[:, :, np.newaxis]  # (H,W) → (H,W,1)
             if arr.ndim == 3:
-                if arr.shape[0] == DATA3D_CH:        # (13,81,81) → (81,81,13)
+                # (13, 81, 81) → (81, 81, 13)
+                if arr.shape[0] == DATA3D_CH:
                     arr = arr.transpose(1, 2, 0)
-                # Now shape should be (H,W,C)
+                # Now expect (H, W, C)
                 H, W, C = arr.shape
-                # Resize spatial if needed
-                if (H != DATA3D_H or W != DATA3D_W):
+                # Resize spatial dims if needed
+                if H != DATA3D_H or W != DATA3D_W:
                     if HAS_CV2:
                         arr = cv2.resize(arr, (DATA3D_W, DATA3D_H))
                     else:
-                        # Simple slice/pad
                         arr = arr[:DATA3D_H, :DATA3D_W, :]
                         if arr.shape[0] < DATA3D_H:
-                            arr = np.pad(arr, ((0, DATA3D_H-arr.shape[0]),(0,0),(0,0)))
+                            arr = np.pad(arr, ((0, DATA3D_H - arr.shape[0]), (0, 0), (0, 0)))
                         if arr.shape[1] < DATA3D_W:
-                            arr = np.pad(arr, ((0,0),(0, DATA3D_W-arr.shape[1]),(0,0)))
+                            arr = np.pad(arr, ((0, 0), (0, DATA3D_W - arr.shape[1]), (0, 0)))
                 # Pad or truncate channels to 13
                 if arr.shape[2] < DATA3D_CH:
                     arr = np.concatenate([
@@ -1691,23 +1787,20 @@ class TrajectoryDataset(Dataset):
                     ], axis=2)
                 arr = arr[:, :, :DATA3D_CH]
 
-                # Per-channel min-max normalise
-                for c in range(DATA3D_CH):
-                    mn, mx = arr[:,:,c].min(), arr[:,:,c].max()
-                    arr[:,:,c] = (arr[:,:,c] - mn) / (mx - mn + 1e-6)
-
-                return arr   # (81, 81, 13)
-        except Exception:
-            pass
+                # Apply global z-score normalization (replaces the old per-sample min-max)
+                arr = self._normalize_data3d(arr)
+                return arr  # (81, 81, 13)
+        except Exception as e:
+            logger.debug(f"Data3d load error {path}: {e}")
         return None
 
     def img_read(self, year: str, ty_name: str, timestamp: str) -> torch.Tensor:
-        """Load satellite image → [81, 81, 13] float tensor."""
+        """Load and normalise one Data3d timestep → [81, 81, 13] float tensor."""
         folder = os.path.join(self.data3d_path, str(year), str(ty_name))
         if not os.path.exists(folder):
             return torch.zeros(DATA3D_H, DATA3D_W, DATA3D_CH)
 
-        # Exact match
+        # Exact-match attempt
         prefix = f"WP{year}{ty_name}_{timestamp}"
         for ext in (".npy", ".nc"):
             p = os.path.join(folder, prefix + ext)
@@ -1716,7 +1809,7 @@ class TrajectoryDataset(Dataset):
                 if arr is not None:
                     return torch.from_numpy(arr).float()
 
-        # Fuzzy match by timestamp
+        # Fuzzy match: find file containing timestamp
         try:
             for fname in sorted(os.listdir(folder)):
                 if timestamp in fname and fname.endswith((".npy", ".nc")):
@@ -1731,9 +1824,12 @@ class TrajectoryDataset(Dataset):
     # ── Env loading ───────────────────────────────────────────────────────
 
     def _load_env_npy(self, year: str, ty_name: str, timestamp: str) -> dict | None:
+        """Load env dict for one timestep. Tries exact and fuzzy filename match."""
         folder = os.path.join(self.env_path, str(year), str(ty_name))
         if not os.path.exists(folder):
             return None
+
+        # Exact match: WP{year}{name}_{ts}.npy or {ts}.npy
         for fname in [f"WP{year}{ty_name}_{timestamp}.npy", f"{timestamp}.npy"]:
             p = os.path.join(folder, fname)
             if os.path.exists(p):
@@ -1742,25 +1838,31 @@ class TrajectoryDataset(Dataset):
                     return env_data_processing(raw)
                 except Exception:
                     pass
+
+        # Fuzzy: any file containing timestamp
         try:
             cands = [f for f in os.listdir(folder)
                      if timestamp in f and f.endswith(".npy")]
             if cands:
-                raw = np.load(os.path.join(folder, cands[0]),
-                              allow_pickle=True).item()
+                raw = np.load(os.path.join(folder, cands[0]), allow_pickle=True).item()
                 return env_data_processing(raw)
         except Exception:
             pass
+
         return None
 
     def _get_env_features(
         self,
-        year: str, ty_name: str,
-        dates: list[str],
-        obs_traj: np.ndarray,   # [2, T_obs]
-        obs_Me:   np.ndarray,   # [2, T_obs]
+        year:     str,
+        ty_name:  str,
+        dates:    list[str],
+        obs_traj: np.ndarray,  # [2, T_obs]  (lon_norm, lat_norm)
+        obs_Me:   np.ndarray,  # [2, T_obs]  (pres_norm, wind_norm)
     ) -> dict:
-        """Build env feature dict for full observation window → each key [T_obs, dim]."""
+        """
+        Build env feature dict for the observation window.
+        Returns dict where each key maps to tensor [T_obs, dim].
+        """
         T = len(dates)
         all_feats = []
         prev_speed = None
@@ -1787,31 +1889,33 @@ class TrajectoryDataset(Dataset):
             for feat in all_feats:
                 v = feat.get(key, [0.0] * dim)
                 t = torch.tensor(v, dtype=torch.float)
-                if t.numel() < dim: t = F.pad(t, (0, dim - t.numel()))
+                if t.numel() < dim:
+                    t = F.pad(t, (0, dim - t.numel()))
                 rows.append(t[:dim])
-            env_out[key] = torch.stack(rows, dim=0)   # [T_obs, dim]
+            env_out[key] = torch.stack(rows, dim=0)  # [T_obs, dim]
         return env_out
 
     def _embed_time(self, date_list: list[str]) -> torch.Tensor:
+        """Embed list of YYYYMMDDHH strings → [1, 4, T] float tensor."""
         rows = []
         for d in date_list:
             try:
                 rows.append([
-                    (float(d[:4]) - 1949) / 70.0 - 0.5,
-                    (float(d[4:6]) - 1)   / 11.0 - 0.5,
-                    (float(d[6:8]) - 1)   / 30.0 - 0.5,
-                    float(d[8:10])         / 18.0 - 0.5,
+                    (float(d[:4]) - 1949) / 70.0 - 0.5,   # year
+                    (float(d[4:6]) - 1)   / 11.0 - 0.5,   # month
+                    (float(d[6:8]) - 1)   / 30.0 - 0.5,   # day
+                    float(d[8:10])         / 18.0 - 0.5,   # hour
                 ])
             except Exception:
-                rows.append([0., 0., 0., 0.])
-        return torch.tensor(rows, dtype=torch.float).t().unsqueeze(0)  # [1,4,T]
+                rows.append([0.0, 0.0, 0.0, 0.0])
+        return torch.tensor(rows, dtype=torch.float).t().unsqueeze(0)  # [1, 4, T]
 
     # ── Dataset interface ─────────────────────────────────────────────────
 
-    def __len__(self):
+    def __len__(self) -> int:
         return self.num_seq
 
-    def __getitem__(self, index):
+    def __getitem__(self, index: int) -> list:
         if self.num_seq == 0:
             raise IndexError("Empty dataset")
 
@@ -1821,34 +1925,46 @@ class TrajectoryDataset(Dataset):
         tyname = str(info["old"][1])
         dates  = info["tydate"]
 
-        # Images → [T_obs, 81, 81, 13]
-        imgs     = [self.img_read(year, tyname, ts) for ts in dates[:self.obs_len]]
-        img_obs  = torch.stack(imgs, dim=0)                        # [T,81,81,13]
+        # ── 3D images for observation window ──────────────────────────────
+        imgs    = [self.img_read(year, tyname, ts) for ts in dates[:self.obs_len]]
+        img_obs  = torch.stack(imgs, dim=0)   # [T_obs, 81, 81, 13]
         img_pred = torch.zeros(self.pred_len, DATA3D_H, DATA3D_W, DATA3D_CH)
 
-        # Trajectory tensors [n_ped, 2, T]
-        obs_traj  = torch.stack([self.obs_traj_raw[i]  for i in range(s, e)])
-        pred_traj = torch.stack([self.pred_traj_raw[i] for i in range(s, e)])
-        obs_rel   = torch.stack([self.obs_rel_raw[i]   for i in range(s, e)])
-        pred_rel  = torch.stack([self.pred_rel_raw[i]  for i in range(s, e)])
-        obs_Me    = torch.stack([self.obs_Me_raw[i]    for i in range(s, e)])
-        pred_Me   = torch.stack([self.pred_Me_raw[i]   for i in range(s, e)])
-        n         = e - s
-        nlp       = [self.non_linear_ped[i] for i in range(s, e)]
-        mask      = torch.ones(n, self.seq_len)
+        # ── Trajectory tensors [n_ped, 2, T] ──────────────────────────────
+        obs_traj      = torch.stack([self.obs_traj_raw[i]    for i in range(s, e)])
+        pred_traj     = torch.stack([self.pred_traj_raw[i]   for i in range(s, e)])
+        obs_rel       = torch.stack([self.obs_rel_raw[i]     for i in range(s, e)])
+        pred_rel      = torch.stack([self.pred_rel_raw[i]    for i in range(s, e)])
+        obs_Me        = torch.stack([self.obs_Me_raw[i]      for i in range(s, e)])
+        pred_Me       = torch.stack([self.pred_Me_raw[i]     for i in range(s, e)])
+        obs_Me_rel    = torch.stack([self.obs_Me_rel_raw[i]  for i in range(s, e)])
+        pred_Me_rel   = torch.stack([self.pred_Me_rel_raw[i] for i in range(s, e)])
 
-        # Env features
-        obs_traj_np = obs_traj[0].numpy()   # [2, T_obs]
+        n    = e - s
+        nlp  = [self.non_linear_ped[i] for i in range(s, e)]
+        mask = torch.ones(n, self.seq_len)
+
+        # ── Env features ──────────────────────────────────────────────────
+        obs_traj_np = obs_traj[0].numpy()   # [2, T_obs]  first ped (all same storm)
         obs_Me_np   = obs_Me[0].numpy()     # [2, T_obs]
         env_out = self._get_env_features(
             year, tyname, dates[:self.obs_len], obs_traj_np, obs_Me_np)
 
         return [
-            obs_traj,   pred_traj,  obs_rel,   pred_rel,
-            nlp,        mask,
-            obs_Me,     pred_Me,    obs_rel,   pred_rel,
-            self._embed_time(dates[:self.obs_len]),
-            self._embed_time(dates[self.obs_len:]),
-            img_obs,    img_pred,
-            env_out,    info,
+            obs_traj,                              # 0  [n_ped, 2, T_obs]
+            pred_traj,                             # 1  [n_ped, 2, T_pred]
+            obs_rel,                               # 2  [n_ped, 2, T_obs]
+            pred_rel,                              # 3  [n_ped, 2, T_pred]
+            nlp,                                   # 4  list[float]
+            mask,                                  # 5  [n_ped, seq_len]
+            obs_Me,                                # 6  [n_ped, 2, T_obs]
+            pred_Me,                               # 7  [n_ped, 2, T_pred]
+            obs_Me_rel,                            # 8  [n_ped, 2, T_obs]
+            pred_Me_rel,                           # 9  [n_ped, 2, T_pred]
+            self._embed_time(dates[:self.obs_len]),  # 10 [1, 4, T_obs]
+            self._embed_time(dates[self.obs_len:]),  # 11 [1, 4, T_pred]
+            img_obs,                               # 12 [T_obs, 81, 81, 13]
+            img_pred,                              # 13 [T_pred, 81, 81, 13]
+            env_out,                               # 14 dict
+            info,                                  # 15 dict
         ]

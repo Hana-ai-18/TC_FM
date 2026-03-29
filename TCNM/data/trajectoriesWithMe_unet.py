@@ -255,52 +255,25 @@
 #         ]
 
 """
-TCNM/data/trajectoriesWithMe_unet.py  ── TEST / INFERENCE VERSION  v9
-=======================================================================
-Synced with training dataset. Supports year filtering.
-Uses shared env_data_processing and seq_collate from training module.
+TCNM/data/trajectoriesWithMe_unet.py  ── v9-fixed (TEST / INFERENCE)
+======================================================================
+Test dataset — inherits TrajectoryDataset from training module.
+Identical logic, defaults to dtype='test' and is_test=True.
 """
 from __future__ import annotations
 
-import logging
-import math
-import os
-
-import numpy as np
-import torch
-import torch.nn.functional as F
-from torch.utils.data import Dataset
-
-try:
-    import cv2
-    HAS_CV2 = True
-except ImportError:
-    HAS_CV2 = False
-
-try:
-    import netCDF4 as nc
-    HAS_NC = True
-except ImportError:
-    HAS_NC = False
-
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
 from TCNM.data.trajectoriesWithMe_unet_training import (
-    env_data_processing,
-    seq_collate,
     TrajectoryDataset as _TrainingDataset,
-)
-from TCNM.env_net_transformer_gphsplit import (
-    build_env_features_one_step,
-    ENV_FEATURE_DIMS,
+    seq_collate,                   # re-export so callers can import from here
+    env_data_processing,
 )
 
 
 class TrajectoryDataset(_TrainingDataset):
     """
-    Test/Inference dataset — inherits from training dataset.
-    Overrides default dtype to 'test'. Everything else identical.
+    Test/Inference dataset — wraps training dataset with test defaults.
+    Overrides type to 'test' and is_test=True.
+    Everything else (normalisation, env loading, Data3d loading) is identical.
     """
 
     def __init__(
@@ -332,3 +305,6 @@ class TrajectoryDataset(_TrainingDataset):
             is_test     = is_test,
             **kwargs,
         )
+
+
+__all__ = ["TrajectoryDataset", "seq_collate", "env_data_processing"]

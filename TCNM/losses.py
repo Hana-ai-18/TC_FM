@@ -293,39 +293,40 @@
 #             value_error(rm, rgm, mode="raw"))
 
 """
-TCNM/losses.py  ── v9
-========================
+TCNM/losses.py  ── v9-fixed
+==============================
 Loss functions for OT-CFM + PINN-BVE TC trajectory prediction.
 
 Loss components:
-  L1  L_FM      : afCRPS (Almost-Fair CRPS, Lang et al. 2026)
+  L1  L_FM      : afCRPS (Almost-Fair CRPS)
   L2  L_dir     : overall direction (first→last displacement cosine)
   L3  L_step    : per-step direction alignment
   L4  L_disp    : displacement speed matching
   L5  L_heading : anti-parallel penalty + signed curvature MSE
-  L6  L_smooth  : trajectory smoothness (finite-difference acceleration)
-  L7  L_PINN    : β-plane BVE residual (Barotropic Vorticity Equation)
+  L6  L_smooth  : trajectory smoothness (2nd-order finite differences)
+  L7  L_PINN    : beta-plane BVE residual
 
 Total: L = 1.0·L1 + 2.0·L2 + 0.5·L3 + 1.0·L4 + 2.0·L5 + 0.2·L6 + 0.5·L7
 
-All trajectories in *normalised* units unless noted.
-NORM_TO_DEG = 5.0  →  lon_deg = norm*5 + 180,  lat_deg = norm*5
+Coordinate convention:
+  Normalised: lon_norm = (lon_01E − 1800)/50,  lat_norm = lat_01N/50
+  NORM_TO_DEG = 5.0  →  lon_deg = norm*5 + 180,  lat_deg = norm*5
 """
 from __future__ import annotations
 
 import math
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 import torch
 import torch.nn.functional as F
 
 # ── Physical constants ────────────────────────────────────────────────────────
-OMEGA        = 7.2921e-5    # Earth rotation rate (rad/s)
-R_EARTH      = 6.371e6      # Earth radius (m)
-DT_6H        = 6 * 3600     # 6-hour step in seconds
-NORM_TO_DEG  = 5.0          # normalised → degrees
-NORM_TO_M    = NORM_TO_DEG * 111_000.0
-PINN_SCALE   = 100.0        # residual upscaling to avoid vanishing gradients
+OMEGA       = 7.2921e-5     # Earth rotation rate (rad/s)
+R_EARTH     = 6.371e6       # Earth radius (m)
+DT_6H       = 6 * 3600      # 6-hour step in seconds
+NORM_TO_DEG = 5.0           # normalised → degrees
+NORM_TO_M   = NORM_TO_DEG * 111_000.0
+PINN_SCALE  = 100.0         # residual upscaling to prevent vanishing gradient
 
 WEIGHTS: Dict[str, float] = dict(
     fm      = 1.0,
@@ -342,21 +343,23 @@ WEIGHTS: Dict[str, float] = dict(
 #  Haversine helper (differentiable)
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _haversine(p1: torch.Tensor, p2: torch.Tensor,
-               unit_01deg: bool = True) -> torch.Tensor:
+def _haversine(
+    p1: torch.Tensor,
+    p2: torch.Tensor,
+    unit_01deg: bool = True,
+) -> torch.Tensor:
     """
     Haversine great-circle distance (km) — differentiable.
 
-    p1, p2 : [..., 2] in normalised units (or 0.1° if unit_01deg=True)
+    p1, p2 : [..., 2] in normalised units
     """
     if unit_01deg:
-        # 0.1° units → degrees
+        # 0.1-degree units → degrees
         lat1 = torch.deg2rad(p1[..., 1] / 10.0)
         lat2 = torch.deg2rad(p2[..., 1] / 10.0)
         dlon = torch.deg2rad((p2[..., 0] - p1[..., 0]) / 10.0)
         dlat = torch.deg2rad((p2[..., 1] - p1[..., 1]) / 10.0)
     else:
-        # normalised → degrees via NORM_TO_DEG
         lat1 = torch.deg2rad(p1[..., 1] * NORM_TO_DEG)
         lat2 = torch.deg2rad(p2[..., 1] * NORM_TO_DEG)
         dlon = torch.deg2rad((p2[..., 0] - p1[..., 0]) * NORM_TO_DEG)
@@ -364,15 +367,7 @@ def _haversine(p1: torch.Tensor, p2: torch.Tensor,
 
     a = (torch.sin(dlat / 2) ** 2
          + torch.cos(lat1) * torch.cos(lat2) * torch.sin(dlon / 2) ** 2)
-    return 2.0 * 6371.0 * torch.asin(a.clamp(0, 1).sqrt())
-
-
-def _denorm_deg(x: torch.Tensor) -> torch.Tensor:
-    """Normalised coords → degrees."""
-    out = x.clone()
-    out[..., 0] = x[..., 0] * NORM_TO_DEG + 180.0
-    out[..., 1] = x[..., 1] * NORM_TO_DEG
-    return out
+    return 2.0 * 6371.0 * torch.asin(a.clamp(0.0, 1.0).sqrt())
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -381,15 +376,12 @@ def _denorm_deg(x: torch.Tensor) -> torch.Tensor:
 
 def fm_afcrps_loss(
     pred_samples: torch.Tensor,  # [M, T, B, 2] normalised
-    gt: torch.Tensor,            # [T, B, 2] normalised
-    unit_01deg: bool = False,
+    gt:           torch.Tensor,  # [T, B, 2] normalised
+    unit_01deg:   bool = False,
 ) -> torch.Tensor:
     """
     Almost-Fair CRPS energy score (Lang et al. 2026).
-
-    CRPS_af = (1/2·M(M-1)) Σ_{s≠s'} [d(Y_s,Y) + d(Y_{s'},Y) - d(Y_s,Y_{s'})] / 2
-
-    With M=1 falls back to plain Haversine loss (mean prediction).
+    With M=1 falls back to plain Haversine loss.
     """
     M, T, B, _ = pred_samples.shape
     if M == 1:
@@ -416,9 +408,9 @@ def fm_afcrps_loss(
 def overall_dir_loss(
     pred: torch.Tensor,   # [T, B, 2]
     gt:   torch.Tensor,
-    ref:  torch.Tensor,   # [B, 2]  last observed position
+    ref:  torch.Tensor,   # [B, 2] last observed position
 ) -> torch.Tensor:
-    """Cosine distance between overall displacement vectors (first → last)."""
+    """Cosine distance between overall displacement vectors (first→last)."""
     p_disp = pred[-1] - ref
     g_disp = gt[-1]   - ref
     pn = p_disp.norm(dim=-1, keepdim=True).clamp(min=1e-6)
@@ -430,10 +422,7 @@ def overall_dir_loss(
 #  L3 — Per-step direction
 # ══════════════════════════════════════════════════════════════════════════════
 
-def step_dir_loss(
-    pred: torch.Tensor,   # [T, B, 2]
-    gt:   torch.Tensor,
-) -> torch.Tensor:
+def step_dir_loss(pred: torch.Tensor, gt: torch.Tensor) -> torch.Tensor:
     """Mean cosine distance of 6-hour velocity vectors."""
     if pred.shape[0] < 2:
         return pred.new_zeros(())
@@ -448,14 +437,11 @@ def step_dir_loss(
 #  L4 — Displacement speed
 # ══════════════════════════════════════════════════════════════════════════════
 
-def disp_loss(
-    pred: torch.Tensor,   # [T, B, 2]
-    gt:   torch.Tensor,
-) -> torch.Tensor:
+def disp_loss(pred: torch.Tensor, gt: torch.Tensor) -> torch.Tensor:
     """MSE between mean step displacement magnitudes."""
     if pred.shape[0] < 2:
         return pred.new_zeros(())
-    pred_d = (pred[1:] - pred[:-1]).norm(dim=-1).mean(0)   # [B]
+    pred_d = (pred[1:] - pred[:-1]).norm(dim=-1).mean(0)  # [B]
     gt_d   = (gt[1:]   - gt[:-1]).norm(dim=-1).mean(0)
     return ((pred_d - gt_d) ** 2).mean()
 
@@ -464,19 +450,15 @@ def disp_loss(
 #  L5 — Heading + curvature
 # ══════════════════════════════════════════════════════════════════════════════
 
-def heading_loss(
-    pred: torch.Tensor,   # [T, B, 2]
-    gt:   torch.Tensor,
-) -> torch.Tensor:
+def heading_loss(pred: torch.Tensor, gt: torch.Tensor) -> torch.Tensor:
     """
-    Combined heading loss:
-      (a) Anti-parallel penalty: ReLU(-cos θ)  [Greer 2021]
-      (b) Signed curvature MSE  [Runge 2021]
-
-    κ_k = (v_{k+1} × v_k) / (|v_{k+1}||v_k|)
+    Combined:
+      (a) Anti-parallel penalty: ReLU(−cos θ)
+      (b) Signed curvature MSE
     """
     if pred.shape[0] < 2:
         return pred.new_zeros(())
+
     pv = pred[1:] - pred[:-1]   # [T-1, B, 2]
     gv = gt[1:]   - gt[:-1]
     pn = pv.norm(dim=-1, keepdim=True).clamp(min=1e-6)
@@ -512,36 +494,36 @@ def smooth_loss(pred: torch.Tensor) -> torch.Tensor:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  L7 — PINN BVE (β-plane Barotropic Vorticity Equation)
+#  L7 — PINN BVE (beta-plane Barotropic Vorticity Equation)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _pinn_simplified(pred_abs: torch.Tensor) -> torch.Tensor:
     """
-    β-plane BVE residual along predicted trajectory.
+    beta-plane BVE residual along predicted trajectory.
 
-    Vorticity tendency:  dζ/dt + β·v = 0
-    Discrete:  (ζ_{k+1} − ζ_k)/Δt + β_k · v_k = 0
+    dζ/dt + β·v = 0
+    Discrete: (ζ_{k+1} − ζ_k)/Δt + β_k · v_k = 0
 
-    where ζ_k = (u_{k} v_{k-1} − v_k u_{k-1}) / |v_{k-1}||v_k|
+    where ζ_k = cross product of successive velocity vectors (relative vorticity proxy)
     and β_k = 2Ω cos(φ_k) / R_Earth
     """
     T = pred_abs.shape[0]
     if T < 4:
         return pred_abs.new_zeros(())
 
-    v   = pred_abs[1:] - pred_abs[:-1]      # [T-1, B, 2]  velocity (normalised)
-    vx  = v[..., 0]
-    vy  = v[..., 1]
+    v  = pred_abs[1:] - pred_abs[:-1]   # [T-1, B, 2]
+    vx = v[..., 0]
+    vy = v[..., 1]
 
     # Relative vorticity proxy: cross product of successive velocity vectors
-    zeta   = vx[1:] * vy[:-1] - vy[1:] * vx[:-1]   # [T-2, B]
+    zeta = vx[1:] * vy[:-1] - vy[1:] * vx[:-1]  # [T-2, B]
     if zeta.shape[0] < 2:
         return pred_abs.new_zeros(())
 
-    dzeta  = zeta[1:] - zeta[:-1]   # [T-3, B]
+    dzeta = zeta[1:] - zeta[:-1]   # [T-3, B]
 
-    # β at mid-trajectory lat
-    lat_rad = (pred_abs[2:T-1, :, 1] * NORM_TO_DEG * (math.pi / 180))
+    # β at mid-trajectory latitude
+    lat_rad = pred_abs[2:T-1, :, 1] * NORM_TO_DEG * (math.pi / 180)
     beta_n  = (2.0 * OMEGA * NORM_TO_M * DT_6H / R_EARTH) * torch.cos(lat_rad)
 
     residual = dzeta + beta_n * vy[1:T-2]
@@ -549,13 +531,9 @@ def _pinn_simplified(pred_abs: torch.Tensor) -> torch.Tensor:
 
 
 def pinn_bve_loss(
-    pred_abs:   torch.Tensor,   # [T, B, 2] normalised
+    pred_abs:  torch.Tensor,   # [T, B, 2] normalised
     batch_list,
 ) -> torch.Tensor:
-    """
-    PINN BVE loss. With scalar u500/v500 in env_data we use the simplified
-    β-plane formulation (full 2D fields not available as grid tensors).
-    """
     return _pinn_simplified(pred_abs)
 
 
@@ -564,18 +542,14 @@ def pinn_bve_loss(
 # ══════════════════════════════════════════════════════════════════════════════
 
 def compute_total_loss(
-    pred_abs:     torch.Tensor,         # [T, B, 2] normalised
-    gt:           torch.Tensor,         # [T, B, 2] normalised
-    ref:          torch.Tensor,         # [B, 2]    last observed position
+    pred_abs:     torch.Tensor,
+    gt:           torch.Tensor,
+    ref:          torch.Tensor,
     batch_list,
-    pred_samples: Optional[torch.Tensor] = None,  # [M, T, B, 2]
+    pred_samples: Optional[torch.Tensor] = None,
     weights:      Dict[str, float] = WEIGHTS,
 ) -> Dict:
-    """
-    Compute all 7 loss components and the weighted total.
-
-    Returns dict with keys: total, fm, dir, step, disp, heading, smooth, pinn
-    """
+    """Compute all 7 loss components and weighted total."""
     if pred_samples is not None:
         l_fm = fm_afcrps_loss(pred_samples, gt, unit_01deg=False)
     else:
@@ -655,7 +629,7 @@ def trajectory_displacement_error(pred, gt, mode="sum"):
 
 
 def evaluate_diffusion_output(best_traj, best_Me, gt_traj, gt_Me):
-    rt, rm   = toNE(best_traj.clone(), best_Me.clone())
-    rg, rgm  = toNE(gt_traj.clone(),  gt_Me.clone())
+    rt, rm  = toNE(best_traj.clone(), best_Me.clone())
+    rg, rgm = toNE(gt_traj.clone(),  gt_Me.clone())
     return (trajectory_displacement_error(rt, rg, mode="raw"),
             torch.abs(rm.permute(1, 0, 2) - rgm.permute(1, 0, 2)))

@@ -473,27 +473,25 @@
 #     main(args)
 
 """
-scripts/train_flowmatching.py  ── v9
-=====================================
+scripts/train_flowmatching.py  ── v9-fixed
+============================================
 Training script for TCFlowMatching v9.
 
-Key features:
-- Data loaded from Kaggle/Drive path via loader.py
-- ENV data: 90-dim feature vector (bearing_scs 16d, dist_boundary 5d, delta_vel 5d)
-- AMP mixed precision + gradient accumulation for fast training
-- torch.compile optional (PyTorch 2.x)
-- All 7 evaluation tables exported to CSV after final test
-- Statistical tests vs CLIPER/Persistence/LSTM/Diffusion
-- PINN sensitivity CSV
-- Computational footprint profiling
-- Val DTW disabled during training (speed)
-- Error arrays saved as .npy for use by statistical_tests.py
+Kaggle + Google Drive usage:
+    # Mount Drive in Colab/Kaggle notebook first:
+    #   from google.colab import drive; drive.mount('/content/drive')
+    # Then:
+    python scripts/train_flowmatching.py \
+        --dataset_root /content/drive/MyDrive/TCND_vn \
+        --output_dir   /kaggle/working/runs/v9 \
+        --use_amp \
+        --num_epochs 200 --batch_size 32
 
-Run on Kaggle:
-    python scripts/train_flowmatching.py \\
-        --dataset_root /kaggle/input/tcnd-vn/TCND_vn \\
-        --output_dir   /kaggle/working/runs/v9 \\
-        --use_amp \\
+    # Pure Kaggle input:
+    python scripts/train_flowmatching.py \
+        --dataset_root /kaggle/input/tcnd-vn/TCND_vn \
+        --output_dir   /kaggle/working/runs/v9 \
+        --use_amp \
         --num_epochs 200 --batch_size 32
 """
 from __future__ import annotations
@@ -532,43 +530,45 @@ from scripts.statistical_tests import run_all_tests
 
 def get_args():
     p = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    # ── Data ──────────────────────────────────────────────────────────────
-    p.add_argument("--dataset_root",    default="TCND_vn",      type=str,
-                   help="Root of TCND_vn (Kaggle mount or local)")
-    p.add_argument("--obs_len",         default=8,              type=int)
-    p.add_argument("--pred_len",        default=12,             type=int)
-    p.add_argument("--test_year",       default=2019,           type=int)
-    # ── Training ─────────────────────────────────────────────────────────
-    p.add_argument("--batch_size",      default=32,             type=int)
-    p.add_argument("--num_epochs",      default=200,            type=int)
-    p.add_argument("--g_learning_rate", default=2e-4,           type=float)
-    p.add_argument("--weight_decay",    default=1e-4,           type=float)
-    p.add_argument("--warmup_epochs",   default=3,              type=int)
-    p.add_argument("--grad_clip",       default=1.0,            type=float)
-    p.add_argument("--grad_accum",      default=1,              type=int,
+    # Data
+    p.add_argument("--dataset_root",    default="TCND_vn",  type=str)
+    p.add_argument("--obs_len",         default=8,          type=int)
+    p.add_argument("--pred_len",        default=12,         type=int)
+    p.add_argument("--test_year",       default=2019,       type=int)
+    # Training
+    p.add_argument("--batch_size",      default=32,         type=int)
+    p.add_argument("--num_epochs",      default=200,        type=int)
+    p.add_argument("--g_learning_rate", default=2e-4,       type=float)
+    p.add_argument("--weight_decay",    default=1e-4,       type=float)
+    p.add_argument("--warmup_epochs",   default=3,          type=int)
+    p.add_argument("--grad_clip",       default=1.0,        type=float)
+    p.add_argument("--grad_accum",      default=1,          type=int,
                    help="Gradient accumulation steps (helps on small GPU)")
-    p.add_argument("--patience",        default=40,             type=int)
-    p.add_argument("--n_train_ens",     default=4,              type=int,
-                   help="Ensemble size during training (afCRPS)")
+    p.add_argument("--patience",        default=40,         type=int)
+    p.add_argument("--n_train_ens",     default=4,          type=int,
+                   help="Ensemble size for afCRPS during training")
     p.add_argument("--use_amp",         action="store_true",
                    help="Mixed precision (faster on GPU)")
-    # ── Model ─────────────────────────────────────────────────────────────
-    p.add_argument("--sigma_min",       default=0.02,           type=float)
-    p.add_argument("--ode_steps",       default=10,             type=int)
-    p.add_argument("--val_ensemble",    default=50,             type=int)
-    # ── Logging ───────────────────────────────────────────────────────────
-    p.add_argument("--output_dir",      default="runs/v9",      type=str)
-    p.add_argument("--save_interval",   default=10,             type=int)
-    p.add_argument("--val_freq",        default=5,              type=int)
-    p.add_argument("--full_eval_freq",  default=20,             type=int)
-    p.add_argument("--metrics_csv",     default="metrics.csv",  type=str)
+    p.add_argument("--num_workers",     default=0,          type=int,
+                   help="DataLoader workers (0 = Kaggle-safe)")
+    # Model
+    p.add_argument("--sigma_min",       default=0.02,       type=float)
+    p.add_argument("--ode_steps",       default=10,         type=int)
+    p.add_argument("--val_ensemble",    default=50,         type=int,
+                   help="Use 10 for fast dev runs, 50 for final eval")
+    # Logging
+    p.add_argument("--output_dir",      default="runs/v9",  type=str)
+    p.add_argument("--save_interval",   default=10,         type=int)
+    p.add_argument("--val_freq",        default=5,          type=int)
+    p.add_argument("--full_eval_freq",  default=20,         type=int)
+    p.add_argument("--metrics_csv",     default="metrics.csv",     type=str)
     p.add_argument("--predict_csv",     default="predictions.csv", type=str)
-    p.add_argument("--gpu_num",         default="0",            type=str)
-    # ── Dataset compat ────────────────────────────────────────────────────
+    p.add_argument("--gpu_num",         default="0",        type=str)
+    # Dataset compat
     p.add_argument("--delim",           default=" ")
-    p.add_argument("--skip",            default=1,              type=int)
-    p.add_argument("--min_ped",         default=1,              type=int)
-    p.add_argument("--threshold",       default=0.002,          type=float)
+    p.add_argument("--skip",            default=1,          type=int)
+    p.add_argument("--min_ped",         default=1,          type=int)
+    p.add_argument("--threshold",       default=0.002,      type=float)
     p.add_argument("--other_modal",     default="gph")
     return p.parse_args()
 
@@ -578,6 +578,7 @@ def get_args():
 # ══════════════════════════════════════════════════════════════════════════════
 
 def move(batch, device):
+    """Move all tensors and dicts-of-tensors in a batch to device."""
     out = list(batch)
     for i, x in enumerate(out):
         if torch.is_tensor(x):
@@ -593,7 +594,7 @@ def move(batch, device):
 # ══════════════════════════════════════════════════════════════════════════════
 
 def evaluate_fast(model, loader, device, ode_steps, pred_len):
-    """Quick Tier-1 evaluation (no DTW/ensemble) for training checkpointing."""
+    """Quick Tier-1 evaluation (no DTW, single sample) for checkpoint gating."""
     model.eval()
     acc = StepErrorAccumulator(pred_len)
     t0  = time.perf_counter()
@@ -614,11 +615,11 @@ def evaluate_fast(model, loader, device, ode_steps, pred_len):
 
 def evaluate_full(model, loader, device, ode_steps, pred_len, val_ensemble,
                   metrics_csv, tag="", predict_csv=""):
-    """Full 4-tier evaluation with ensemble."""
+    """Full 4-tier evaluation with ensemble (DTW disabled for speed)."""
     model.eval()
-    ev = TCEvaluator(pred_len=pred_len, compute_dtw=False)   # DTW off for speed
-    obs_seqs_01 = []
-    gt_seqs_01  = []
+    ev = TCEvaluator(pred_len=pred_len, compute_dtw=False)
+    obs_seqs_01  = []
+    gt_seqs_01   = []
     pred_seqs_01 = []
 
     with torch.no_grad():
@@ -629,10 +630,10 @@ def evaluate_full(model, loader, device, ode_steps, pred_len, val_ensemble,
                 bl, num_ensemble=val_ensemble, ddim_steps=ode_steps,
                 predict_csv=predict_csv if predict_csv else None,
             )
-            pd = denorm_torch(pred_mean).cpu().numpy()   # [T, B, 2]
+            pd = denorm_torch(pred_mean).cpu().numpy()    # [T, B, 2]
             gd = denorm_torch(gt).cpu().numpy()
             od = denorm_torch(bl[0]).cpu().numpy()
-            ed = denorm_torch(all_trajs).cpu().numpy()   # [S, T, B, 2]
+            ed = denorm_torch(all_trajs).cpu().numpy()    # [S, T, B, 2]
 
             for b in range(pd.shape[1]):
                 ens_b = ed[:, :, b, :]   # [S, T, 2]
@@ -670,12 +671,12 @@ class BestModelSaver:
                 train_loss       = tl,
                 val_loss         = vl,
                 val_ade_km       = ade,
-                model_version    = "v9",
+                model_version    = "v9-fixed",
             ), os.path.join(out_dir, "best_model.pth"))
-            print(f"  ✅  Best ADE {ade:.1f} km  (epoch {epoch})")
+            print(f"  Best ADE {ade:.1f} km  (epoch {epoch})")
         else:
             self.counter += 1
-            print(f"  ⏳  No improvement {self.counter}/{self.patience}")
+            print(f"  No improvement {self.counter}/{self.patience}")
             if self.counter >= self.patience:
                 self.early_stop = True
 
@@ -698,13 +699,14 @@ def main(args):
     os.makedirs(stat_dir,   exist_ok=True)
 
     print("=" * 68)
-    print("  TC-FlowMatching v9  |  OT-CFM + PINN-BVE  |  ENV-LSTM 90-dim")
+    print("  TC-FlowMatching v9-fixed  |  OT-CFM + PINN-BVE  |  ENV-LSTM 90-dim")
     print("=" * 68)
     print(f"  device       : {device}")
     print(f"  dataset_root : {args.dataset_root}")
     print(f"  output_dir   : {args.output_dir}")
     print(f"  use_amp      : {args.use_amp}")
     print(f"  grad_accum   : {args.grad_accum}")
+    print(f"  num_workers  : {args.num_workers}")
 
     # ── Data ──────────────────────────────────────────────────────────────
     _, train_loader = data_loader(
@@ -713,18 +715,12 @@ def main(args):
         args, {"root": args.dataset_root, "type": "val"}, test=True)
 
     test_loader = None
-    test_root   = os.path.join(args.dataset_root, "Data1d", "test")
-    if not os.path.exists(test_root):
-        # try walk-up resolution
-        import sys
-        sys.path.insert(0, os.path.abspath(".."))
-        from TCNM.data.loader import _find_tcnd_root
-        r = _find_tcnd_root(args.dataset_root)
-        test_root = os.path.join(r, "Data1d", "test")
-    if os.path.exists(os.path.dirname(test_root)):
+    try:
         _, test_loader = data_loader(
             args, {"root": args.dataset_root, "type": "test"},
             test=True, test_year=args.test_year)
+    except Exception as e:
+        print(f"  Warning: test loader failed: {e}")
 
     print(f"  train : {len(train_loader.dataset)} seq")
     print(f"  val   : {len(val_loader.dataset)} seq")
@@ -742,16 +738,16 @@ def main(args):
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"  params  : {n_params:,}\n")
 
-    # Optional torch.compile (PyTorch 2.x)
+    # Optional torch.compile (PyTorch >= 2.0)
     try:
         model = torch.compile(model, mode="reduce-overhead")
-        print("  torch.compile  ✓")
+        print("  torch.compile: enabled")
     except Exception:
         pass
 
     optimizer   = optim.AdamW(model.parameters(),
-                              lr=args.g_learning_rate,
-                              weight_decay=args.weight_decay)
+                               lr=args.g_learning_rate,
+                               weight_decay=args.weight_decay)
     total_steps = len(train_loader) * args.num_epochs // max(args.grad_accum, 1)
     warmup      = len(train_loader) * args.warmup_epochs // max(args.grad_accum, 1)
     scheduler   = get_cosine_schedule_with_warmup(optimizer, warmup, total_steps)
@@ -797,17 +793,17 @@ def main(args):
                 lr = optimizer.param_groups[0]["lr"]
                 print(f"  [{epoch:>3}/{args.num_epochs}][{i:>3}/{len(train_loader)}]"
                       f"  loss={bd['total'].item():.4f}"
-                      f"  fm={bd.get('fm', 0):.3f}"
-                      f"  heading={bd.get('heading', 0):.3f}"
-                      f"  pinn={bd.get('pinn', 0):.4f}"
+                      f"  fm={bd.get('fm',0):.3f}"
+                      f"  heading={bd.get('heading',0):.3f}"
+                      f"  pinn={bd.get('pinn',0):.4f}"
                       f"  lr={lr:.2e}")
 
-        ep_s = time.perf_counter() - t0
+        ep_s  = time.perf_counter() - t0
         epoch_times.append(ep_s)
-        n    = len(train_loader)
+        n     = len(train_loader)
         avg_t = sum_loss / n
 
-        # Validation loss (fast)
+        # Validation loss
         model.eval()
         val_loss = 0.0
         with torch.no_grad():
@@ -817,7 +813,7 @@ def main(args):
                     val_loss += model.get_loss(bl_v).item()
         avg_v = val_loss / len(val_loader)
 
-        # Val ADE check
+        # Val ADE check (fast, single sample)
         if epoch % args.val_freq == 0 or epoch < 3:
             m = evaluate_fast(model, val_loader, device, args.ode_steps, args.pred_len)
             print(f"\n{'─'*60}  Epoch {epoch:>3}")
@@ -826,7 +822,7 @@ def main(args):
                   f"72h={m.get('72h', 0):.0f} km\n")
             saver(m["ADE"], model, args.output_dir, epoch, optimizer, avg_t, avg_v)
 
-        # Full eval
+        # Full eval with ensemble (slow — use val_ensemble=10 for dev)
         if epoch % args.full_eval_freq == 0 and epoch > 0:
             print(f"  [Full eval epoch {epoch}]")
             dm, _, _, _ = evaluate_full(
@@ -859,8 +855,8 @@ def main(args):
                 model.load_state_dict(ck["model_state_dict"])
             except Exception:
                 model.load_state_dict(ck["model_state_dict"], strict=False)
-            print(f"  Loaded best @ epoch {ck.get('epoch', '?')}  "
-                  f"(ADE={ck.get('val_ade_km', '?'):.1f} km)")
+            print(f"  Loaded best @ epoch {ck.get('epoch','?')}"
+                  f"  (ADE={ck.get('val_ade_km','?'):.1f} km)")
 
         dm_test, obs_seqs, gt_seqs, pred_seqs = evaluate_full(
             model, test_loader, device,
@@ -892,7 +888,7 @@ def main(args):
             params_M     = sum(p.numel() for p in model.parameters()) / 1e6,
         ))
 
-        # ── Build baseline error arrays ────────────────────────────────────
+        # ── Baseline error arrays ──────────────────────────────────────────
         _, cliper_errs  = cliper_errors(obs_seqs, gt_seqs, args.pred_len)
         persist_errs    = persistence_errors(obs_seqs, gt_seqs, args.pred_len)
 
@@ -904,14 +900,13 @@ def main(args):
             for p, g in zip(pred_seqs, gt_seqs)
         ])
 
-        # Dummy LSTM / Diffusion placeholders (replace with real runs)
-        n_seq = len(fmpinn_per_seq)
-        lstm_per_seq      = cliper_errs.mean(1) * 0.82   # placeholder
-        diffusion_per_seq = cliper_errs.mean(1) * 0.70   # placeholder
+        # Placeholder baselines (replace with real model runs)
+        lstm_per_seq      = cliper_errs.mean(1) * 0.82
+        diffusion_per_seq = cliper_errs.mean(1) * 0.70
 
         # Save error arrays for external use
-        np.save(os.path.join(stat_dir, "fmpinn.npy"),     fmpinn_per_seq)
-        np.save(os.path.join(stat_dir, "cliper.npy"),     cliper_errs.mean(1))
+        np.save(os.path.join(stat_dir, "fmpinn.npy"),      fmpinn_per_seq)
+        np.save(os.path.join(stat_dir, "cliper.npy"),      cliper_errs.mean(1))
         np.save(os.path.join(stat_dir, "persistence.npy"), persist_errs.mean(1))
         np.save(os.path.join(stat_dir, "lstm.npy"),        lstm_per_seq)
         np.save(os.path.join(stat_dir, "diffusion.npy"),   diffusion_per_seq)
@@ -926,7 +921,7 @@ def main(args):
             out_dir       = stat_dir,
         )
 
-        # ── Baseline ModelResult rows ───────────────────────────────────────
+        # ── Baseline ModelResult rows ──────────────────────────────────────
         all_results += [
             ModelResult("CLIPER",      "test",
                         ADE=float(cliper_errs.mean()),
@@ -938,7 +933,7 @@ def main(args):
                         n_total=len(gt_seqs)),
         ]
 
-        # ── Paired test rows (for evaluation_tables) ───────────────────────
+        # ── Paired test rows ───────────────────────────────────────────────
         stat_rows = [
             paired_tests(fmpinn_per_seq, cliper_errs.mean(1),
                          "FM+PINN vs CLIPER", 5),
@@ -951,14 +946,14 @@ def main(args):
         ]
 
         # ── Compute footprint ──────────────────────────────────────────────
+        compute_rows = DEFAULT_COMPUTE
         try:
             sample_batch = next(iter(test_loader))
             sample_batch = move(list(sample_batch), device)
             from utils.evaluation_tables import profile_model_components
             compute_rows = profile_model_components(model, sample_batch, device)
         except Exception as e:
-            print(f"  Compute profiling failed: {e}")
-            compute_rows = DEFAULT_COMPUTE
+            print(f"  Compute profiling skipped: {e}")
 
         # ── Export all tables ──────────────────────────────────────────────
         export_all_tables(
@@ -970,10 +965,10 @@ def main(args):
             out_dir        = tables_dir,
         )
 
-        # Save test summary text
+        # Save text summary
         with open(os.path.join(args.output_dir, "test_results.txt"), "w") as fh:
             fh.write(dm_test.summary())
-            fh.write(f"\n\nmodel_version  : FM+PINN v9\n")
+            fh.write(f"\n\nmodel_version  : FM+PINN v9-fixed\n")
             fh.write(f"sigma_min      : {args.sigma_min}\n")
             fh.write(f"test_year      : {args.test_year}\n")
             fh.write(f"train_time_h   : {total_train_h:.2f}\n")

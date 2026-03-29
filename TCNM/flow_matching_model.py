@@ -408,41 +408,28 @@
 
 # # Backward-compatibility alias
 # TCDiffusion = TCFlowMatching
-
 """
-TCNM/flow_matching_model.py  ── v9
-====================================
+TCNM/flow_matching_model.py  ── v9-fixed
+==========================================
 OT-CFM Flow Matching + PINN-BVE for TC trajectory prediction.
 
-Architecture (following paper, NO GC-Net):
-─────────────────────────────────────────────────────────────────
-  Data3d [B,13,T,81,81]
-    └─► 3D-UNet.encode()
-          ├─► e_3d_En [B,128,T//4,5,5]   (bottleneck)
-          └─► e_3d_De [B,1,T,1,1]        (future 3d prediction, for De-LSTM)
-
-  Data1d [T,B,2] + Me [T,B,2]
-    └─► MLP_1d → e_1d^En [B,T,h1]
-         └─ cat(e_3d_En_pooled, e_1d^En)
-              └─► En-LSTM → h_t [B,128]   (Eq.7–9 in paper)
-
-  Env data (90-dim dict)
-    └─► Env-T-Net (CNN+MLP+Transformer, Eq.10–13) → e_Env-time [B,64]
-
-  Context fusion: cat(h_t, e_Env_time, spatial_pool) → ctx [B,128]
-
-  FlowMatching VelocityField (Transformer decoder):
-    x_t [B,T,4] + t [B] + ctx [B,128]
-      └─► predicted velocity [B,T,4]
-           └─► Euler ODE → predicted trajectory
-
-Batch list indices (from seq_collate):
+Batch list indices (from seq_collate — matches exactly):
   0  obs_traj   [T_obs, B, 2]
   1  pred_traj  [T_pred, B, 2]
+  2  obs_rel    [T_obs, B, 2]
+  3  pred_rel   [T_pred, B, 2]
+  4  nlp        tensor
+  5  mask       [seq_len, B]
+  6  seq_start_end [B, 2]
   7  obs_Me     [T_obs, B, 2]
   8  pred_Me    [T_pred, B, 2]
-  11 img_obs    [B, 13, T_obs, 81, 81]   ← 13 channels: GPH×4 + U×4 + V×4 + SST×1
+  9  obs_Me_rel [T_obs, B, 2]
+  10 pred_Me_rel[T_pred, B, 2]
+  11 img_obs    [B, 13, T_obs, 81, 81]
+  12 img_pred   [B, 13, T_pred, 81, 81]
   13 env_data   dict
+  14 None
+  15 list[dict]
 """
 from __future__ import annotations
 
@@ -462,31 +449,25 @@ from TCNM.losses import compute_total_loss, WEIGHTS
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  1D-Data Encoder  (paper Eq. 7–9)
+#  1D-Data Encoder  (Eq. 7–9)
 # ══════════════════════════════════════════════════════════════════════════════
 
 class DataEncoder1D(nn.Module):
     """
     1D-Data Encoder — processes Data1d fused with 3D bottleneck features.
 
-    Eq.7  e_1d^En = φ(X_1d ; W_MLP_1d)
-    Eq.8  e^En    = φ(cat(e_3d^En, e_1d^En) ; W_MLP_fusion)
-    Eq.9  h_t     = En-LSTM(h_{t-1}, e_t^En ; W_En-LSTM)
-
-    Input dimensions:
-      obs_in   : [B, T, 4]   (lon_norm, lat_norm, pres_norm, wind_norm)
-      feat_3d  : [B, T, d3]  (pooled 3D-UNet bottleneck per timestep)
-    Output:
-      h_n      : [B, lstm_hidden]  final hidden state
+    Eq.7  e_1d  = MLP(X_1d)                      [B, T, mlp_h]
+    Eq.8  e_En  = MLP_fusion(cat(e_3d, e_1d))    [B, T, mlp_h*2]
+    Eq.9  h_t   = En-LSTM(e_En)[-1]              [B, lstm_hidden]
     """
 
     def __init__(
         self,
-        in_1d:       int = 4,     # lon, lat, pres, wind (normalised)
-        feat_3d_dim: int = 128,   # pooled 3D-UNet bottleneck dim
-        mlp_h:       int = 64,
-        lstm_hidden: int = 128,
-        lstm_layers: int = 3,
+        in_1d:       int   = 4,    # lon_norm, lat_norm, pres_norm, wind_norm
+        feat_3d_dim: int   = 128,  # pooled UNet bottleneck per timestep
+        mlp_h:       int   = 64,
+        lstm_hidden: int   = 128,
+        lstm_layers: int   = 3,
         dropout:     float = 0.2,
     ):
         super().__init__()
@@ -498,7 +479,7 @@ class DataEncoder1D(nn.Module):
             nn.GELU(),
         )
 
-        # Eq.8 — MLP fusion of e_3d + e_1d
+        # Eq.8 — fusion MLP
         self.mlp_fusion = nn.Sequential(
             nn.Linear(feat_3d_dim + mlp_h, mlp_h * 2),
             nn.LayerNorm(mlp_h * 2),
@@ -517,14 +498,13 @@ class DataEncoder1D(nn.Module):
 
     def forward(
         self,
-        obs_in:   torch.Tensor,   # [B, T, 4]
-        feat_3d:  torch.Tensor,   # [B, T, feat_3d_dim]
-    ) -> torch.Tensor:            # [B, lstm_hidden]
-        e_1d    = self.mlp_1d(obs_in)                      # [B, T, mlp_h]
-        e_en    = self.mlp_fusion(
-            torch.cat([feat_3d, e_1d], dim=-1))             # [B, T, mlp_h*2]
+        obs_in:  torch.Tensor,  # [B, T, 4]
+        feat_3d: torch.Tensor,  # [B, T, feat_3d_dim]
+    ) -> torch.Tensor:          # [B, lstm_hidden]
+        e_1d  = self.mlp_1d(obs_in)                             # [B, T, mlp_h]
+        e_en  = self.mlp_fusion(torch.cat([feat_3d, e_1d], dim=-1))  # [B, T, mlp_h*2]
         _, (h_n, _) = self.en_lstm(e_en)
-        return h_n[-1]                                      # [B, lstm_hidden]
+        return h_n[-1]                                           # [B, lstm_hidden]
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -536,10 +516,10 @@ class VelocityField(nn.Module):
     OT-CFM velocity field  v_θ(x_t, t, context).
 
     Context assembly:
-      h_t       [B, 128]  ← En-LSTM output (1D-Data Encoder)
-      e_Env     [B,  64]  ← Env-T-Net output
-      f_spatial [B,  16]  ← 3D-UNet decoder pooled (for direct spatial info)
-      ─────────────────────
+      h_t       [B, 128]  ← En-LSTM (1D-Data Encoder)
+      e_Env     [B,  64]  ← Env-T-Net
+      f_spatial [B,  16]  ← UNet decoder pooled
+      ─────────────────
       total     [B, 208]  → ctx_fc → [B, ctx_dim=128]
 
     Trajectory decoder: TransformerDecoder + linear head → [B, T, 4]
@@ -547,11 +527,11 @@ class VelocityField(nn.Module):
 
     def __init__(
         self,
-        pred_len:    int   = 12,
-        obs_len:     int   = 8,
-        ctx_dim:     int   = 128,
-        sigma_min:   float = 0.02,
-        unet_in_ch:  int   = 13,   # 13-channel Data3d input
+        pred_len:   int   = 12,
+        obs_len:    int   = 8,
+        ctx_dim:    int   = 128,
+        sigma_min:  float = 0.02,
+        unet_in_ch: int   = 13,
     ):
         super().__init__()
         self.pred_len  = pred_len
@@ -559,15 +539,16 @@ class VelocityField(nn.Module):
         self.sigma_min = sigma_min
 
         # ── 3D-UNet (Data3d encoder) ──────────────────────────────────────
-        self.spatial_enc  = Unet3D(in_channel=unet_in_ch, out_channel=1)
-        # Pool bottleneck [B,128,T//4,H//16,W//16] → [B, 128] per timestep
-        self.bottleneck_pool  = nn.AdaptiveAvgPool3d((None, 1, 1))  # keep T
-        self.bottleneck_proj  = nn.Linear(128, 128)                  # per-t proj
-        # Pool decoder output [B,1,T,1,1] → [B,16]
-        self.decoder_pool = nn.AdaptiveAvgPool2d((1, 1))
+        self.spatial_enc = Unet3D(in_channel=unet_in_ch, out_channel=1)
+
+        # Bottleneck [B,128,T//4,H',W'] → keep T, pool spatial → [B,T_bot,128]
+        self.bottleneck_pool = nn.AdaptiveAvgPool3d((None, 1, 1))
+        self.bottleneck_proj = nn.Linear(128, 128)
+
+        # Decoder [B,1,T,1,1] → squeeze → [B,T] → mean → [B,1] → proj → [B,16]
         self.decoder_proj = nn.Linear(1, 16)
 
-        # ── 1D-Data Encoder (Eq.7–9) ──────────────────────────────────────
+        # ── 1D-Data Encoder (Eq. 7–9) ──────────────────────────────────
         self.enc_1d = DataEncoder1D(
             in_1d       = 4,
             feat_3d_dim = 128,
@@ -577,10 +558,10 @@ class VelocityField(nn.Module):
             dropout     = 0.2,
         )
 
-        # ── Env-T-Net (Eq.10–13) ─────────────────────────────────────────
+        # ── Env-T-Net (Eq. 10–13) ────────────────────────────────────────
         self.env_enc = Env_net(obs_len=obs_len, d_model=64)
 
-        # ── Context fusion: 128 + 64 + 16 = 208 → ctx_dim ────────────────
+        # ── Context fusion: 128 + 64 + 16 = 208 → ctx_dim ──────────────
         self.ctx_fc1  = nn.Linear(128 + 64 + 16, 512)
         self.ctx_ln   = nn.LayerNorm(512)
         self.ctx_drop = nn.Dropout(0.15)
@@ -590,7 +571,7 @@ class VelocityField(nn.Module):
         self.time_fc1 = nn.Linear(128, 256)
         self.time_fc2 = nn.Linear(256, 128)
 
-        # ── Trajectory Transformer decoder ───────────────────────────────
+        # ── Trajectory Transformer decoder ──────────────────────────────
         self.traj_embed = nn.Linear(4, 128)
         self.pos_enc    = nn.Parameter(torch.randn(1, pred_len, 128) * 0.02)
         self.transformer = nn.TransformerDecoder(
@@ -615,74 +596,78 @@ class VelocityField(nn.Module):
         emb = torch.cat([emb.sin(), emb.cos()], dim=-1)
         return F.pad(emb, (0, dim % 2))
 
-    # ── Context vector ────────────────────────────────────────────────────
+    # ── Build context vector ──────────────────────────────────────────────
 
     def _context(self, batch_list: List) -> torch.Tensor:
-        obs_traj  = batch_list[0]    # [T_obs, B, 2]
-        obs_Me    = batch_list[7]    # [T_obs, B, 2]
-        image_obs = batch_list[11]   # [B, 13, T_obs, 81, 81]  ← 13 channels
-        env_data  = batch_list[13]   # dict
+        obs_traj  = batch_list[0]   # [T_obs, B, 2]
+        obs_Me    = batch_list[7]   # [T_obs, B, 2]
+        image_obs = batch_list[11]  # [B, 13, T_obs, 81, 81]
+        env_data  = batch_list[13]  # dict
 
-        # ── 3D-UNet: encode Data3d ────────────────────────────────────────
-        # Ensure correct shape [B, C, T, H, W]
+        # ── 3D-UNet ───────────────────────────────────────────────────────
+        # Ensure shape [B, C, T, H, W]
         if image_obs.dim() == 4:
             image_obs = image_obs.unsqueeze(1)
-        # If C==1 but need 13 channels, tile (fallback for old data)
-        if image_obs.shape[1] == 1 and image_obs.shape[1] != self.spatial_enc.inc.skip.in_channels:
-            image_obs = image_obs.expand(-1, self.spatial_enc.inc.skip.in_channels, -1, -1, -1)
+
+        # If single-channel input, tile to expected channel count
+        expected_ch = self.spatial_enc.inc.skip.in_channels
+        if image_obs.shape[1] == 1 and expected_ch != 1:
+            image_obs = image_obs.expand(-1, expected_ch, -1, -1, -1)
 
         e_3d_bot, e_3d_dec = self.spatial_enc.encode(image_obs)
-        # e_3d_bot: [B, 128, T//4, H', W'] — pool spatial, keep T
+        # e_3d_bot: [B, 128, T_bot, H', W']
+
         B = e_3d_bot.shape[0]
-        T_bot = e_3d_bot.shape[2]
-        e_3d_bot_s = self.bottleneck_pool(e_3d_bot)          # [B,128,T_bot,1,1]
-        e_3d_bot_s = e_3d_bot_s.squeeze(-1).squeeze(-1)      # [B,128,T_bot]
-        e_3d_bot_s = e_3d_bot_s.permute(0, 2, 1)             # [B,T_bot,128]
-        e_3d_bot_s = self.bottleneck_proj(e_3d_bot_s)        # [B,T_bot,128]
-
-        # Interpolate to obs_len so it aligns with Data1d timesteps
         T_obs = obs_traj.shape[0]
+
+        # Pool spatial dims, keep T: [B, 128, T_bot, 1, 1] → [B, T_bot, 128]
+        e_3d_s = self.bottleneck_pool(e_3d_bot).squeeze(-1).squeeze(-1)  # [B, 128, T_bot]
+        e_3d_s = e_3d_s.permute(0, 2, 1)                                 # [B, T_bot, 128]
+        e_3d_s = self.bottleneck_proj(e_3d_s)                            # [B, T_bot, 128]
+
+        # Interpolate T_bot → T_obs to align with Data1d timesteps
+        T_bot = e_3d_s.shape[1]
         if T_bot != T_obs:
-            e_3d_bot_s = F.interpolate(
-                e_3d_bot_s.permute(0, 2, 1),  # [B,128,T_bot]
+            e_3d_s = F.interpolate(
+                e_3d_s.permute(0, 2, 1),   # [B, 128, T_bot]
                 size=T_obs, mode="linear", align_corners=False,
-            ).permute(0, 2, 1)                # [B,T_obs,128]
+            ).permute(0, 2, 1)             # [B, T_obs, 128]
 
-        # Decoder pool → spatial summary [B,16]
-        # e_3d_dec: [B,1,T,1,1] → mean over T → [B,1] → proj → [B,16]
-        f_spatial_raw = e_3d_dec.mean(dim=(2, 3, 4))         # [B,1]
-        f_spatial = self.decoder_proj(f_spatial_raw)         # [B,16]
+        # Decoder spatial summary: [B, 1, T, 1, 1] → mean(T) → [B, 1] → [B, 16]
+        f_spatial_raw = e_3d_dec.mean(dim=(2, 3, 4))   # [B, 1]
+        f_spatial     = self.decoder_proj(f_spatial_raw)  # [B, 16]
 
-        # ── 1D-Data Encoder (Eq.7–9) ──────────────────────────────────────
-        obs_in = torch.cat([obs_traj, obs_Me], dim=2).permute(1, 0, 2)  # [B,T,4]
-        h_t    = self.enc_1d(obs_in, e_3d_bot_s)             # [B,128]
+        # ── 1D-Data Encoder (Eq. 7–9) ────────────────────────────────────
+        # Concatenate traj (lon,lat) and Me (pres,wind) → [B, T, 4]
+        obs_in = torch.cat([obs_traj, obs_Me], dim=2).permute(1, 0, 2)  # [B, T, 4]
+        h_t    = self.enc_1d(obs_in, e_3d_s)   # [B, 128]
 
-        # ── Env-T-Net (Eq.10–13) ─────────────────────────────────────────
-        e_env, _, _ = self.env_enc(env_data, image_obs)      # [B,64]
+        # ── Env-T-Net (Eq. 10–13) ────────────────────────────────────────
+        e_env, _, _ = self.env_enc(env_data, image_obs)  # [B, 64]
 
         # ── Fuse: [128 + 64 + 16] → [ctx_dim] ───────────────────────────
-        ctx = torch.cat([h_t, e_env, f_spatial], dim=-1)     # [B, 208]
+        ctx = torch.cat([h_t, e_env, f_spatial], dim=-1)  # [B, 208]
         ctx = F.gelu(self.ctx_ln(self.ctx_fc1(ctx)))
         ctx = self.ctx_drop(ctx)
-        return self.ctx_fc2(ctx)                              # [B, ctx_dim]
+        return self.ctx_fc2(ctx)  # [B, ctx_dim]
 
     # ── Forward ──────────────────────────────────────────────────────────
 
     def forward(
         self,
-        x_t:        torch.Tensor,   # [B, T_pred, 4]
-        t:          torch.Tensor,   # [B]
+        x_t:        torch.Tensor,  # [B, T_pred, 4]
+        t:          torch.Tensor,  # [B]
         batch_list: List,
-    ) -> torch.Tensor:              # [B, T_pred, 4]
+    ) -> torch.Tensor:             # [B, T_pred, 4]
         ctx   = self._context(batch_list)
         t_emb = F.gelu(self.time_fc1(self._time_emb(t)))
-        t_emb = self.time_fc2(t_emb)                         # [B, 128]
+        t_emb = self.time_fc2(t_emb)  # [B, 128]
 
         x_emb  = self.traj_embed(x_t) + self.pos_enc + t_emb.unsqueeze(1)
-        memory = torch.cat([t_emb.unsqueeze(1), ctx.unsqueeze(1)], dim=1)
+        memory = torch.cat([t_emb.unsqueeze(1), ctx.unsqueeze(1)], dim=1)  # [B, 2, 128]
 
         out = self.transformer(x_emb, memory)
-        return self.out_fc2(F.gelu(self.out_fc1(out)))        # [B, T, 4]
+        return self.out_fc2(F.gelu(self.out_fc1(out)))  # [B, T_pred, 4]
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -692,15 +677,14 @@ class VelocityField(nn.Module):
 class TCFlowMatching(nn.Module):
     """
     TC trajectory prediction via OT-CFM + PINN-BVE.
-    No GC-Net — context goes directly from En-LSTM to VelocityField.
 
-    Training:
+    Training loss:
         L = 1.0·L_FM + 2.0·L_dir + 0.5·L_step
           + 1.0·L_disp + 2.0·L_heading + 0.2·L_smooth + 0.5·L_PINN
 
     Inference:
-        Euler ODE integration (ddim_steps steps) × num_ensemble samples
-        Returns (traj_mean, Me_mean, all_trajs)
+        Euler ODE integration (ddim_steps) × num_ensemble samples
+        → (traj_mean [T,B,2], Me_mean [T,B,2], all_trajs [S,T,B,2])
     """
 
     def __init__(
@@ -709,7 +693,7 @@ class TCFlowMatching(nn.Module):
         obs_len:     int   = 8,
         sigma_min:   float = 0.02,
         n_train_ens: int   = 4,
-        unet_in_ch:  int   = 13,   # 13-channel Data3d
+        unet_in_ch:  int   = 13,
         **kwargs,
     ):
         super().__init__()
@@ -728,26 +712,30 @@ class TCFlowMatching(nn.Module):
 
     @staticmethod
     def _to_rel(
-        traj_gt:  torch.Tensor,   # [T, B, 2]
-        Me_gt:    torch.Tensor,   # [T, B, 2]
-        last_pos: torch.Tensor,   # [B, 2]
-        last_Me:  torch.Tensor,   # [B, 2]
-    ) -> torch.Tensor:            # [B, T, 4]
+        traj_gt:  torch.Tensor,  # [T, B, 2]
+        Me_gt:    torch.Tensor,  # [T, B, 2]
+        last_pos: torch.Tensor,  # [B, 2]
+        last_Me:  torch.Tensor,  # [B, 2]
+    ) -> torch.Tensor:           # [B, T, 4]
+        """Convert absolute trajectories to relative (offset from last obs)."""
         return torch.cat(
             [traj_gt - last_pos.unsqueeze(0),
              Me_gt   - last_Me.unsqueeze(0)],
             dim=-1,
-        ).permute(1, 0, 2)
+        ).permute(1, 0, 2)  # [B, T, 4]
 
     @staticmethod
     def _to_abs(
-        rel:      torch.Tensor,   # [B, T, 4]
-        last_pos: torch.Tensor,   # [B, 2]
-        last_Me:  torch.Tensor,   # [B, 2]
+        rel:      torch.Tensor,  # [B, T, 4]
+        last_pos: torch.Tensor,  # [B, 2]
+        last_Me:  torch.Tensor,  # [B, 2]
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        d = rel.permute(1, 0, 2)  # [T, B, 4]
-        return (last_pos.unsqueeze(0) + d[:, :, :2],
-                last_Me.unsqueeze(0)  + d[:, :, 2:])
+        """Convert relative back to absolute."""
+        d = rel.permute(1, 0, 2)   # [T, B, 4]
+        return (
+            last_pos.unsqueeze(0) + d[:, :, :2],   # traj [T, B, 2]
+            last_Me.unsqueeze(0)  + d[:, :, 2:],   # Me   [T, B, 2]
+        )
 
     # ── OT-CFM noise schedule ─────────────────────────────────────────────
 
@@ -755,7 +743,7 @@ class TCFlowMatching(nn.Module):
         self, x1: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        OT-CFM interpolant:
+        OT-CFM linear interpolant:
           x_t = t·x1 + (1 − t(1−σ))·x0
           u_t = (x1 − (1−σ)·x_t) / (1 − (1−σ)·t)
         """
@@ -776,29 +764,29 @@ class TCFlowMatching(nn.Module):
 
     def get_loss_breakdown(self, batch_list: List) -> Dict:
         """Compute total loss + all components for logging."""
-        traj_gt = batch_list[1]   # [T, B, 2]
-        Me_gt   = batch_list[8]
-        obs_t   = batch_list[0]
-        obs_Me  = batch_list[7]
+        traj_gt = batch_list[1]   # [T_pred, B, 2]
+        Me_gt   = batch_list[8]   # [T_pred, B, 2]   ← index 8 (pred_Me)
+        obs_t   = batch_list[0]   # [T_obs, B, 2]
+        obs_Me  = batch_list[7]   # [T_obs, B, 2]
 
-        lp, lm = obs_t[-1], obs_Me[-1]              # [B, 2]
-        x1 = self._to_rel(traj_gt, Me_gt, lp, lm)   # [B, T, 4]
+        lp, lm = obs_t[-1], obs_Me[-1]               # [B, 2]
+        x1 = self._to_rel(traj_gt, Me_gt, lp, lm)   # [B, T_pred, 4]
 
         x_t, t, te, denom, _ = self._cfm_noisy(x1)
         pred_vel = self.net(x_t, t, batch_list)
 
-        # M ensemble samples for afCRPS
+        # Ensemble samples for afCRPS
         samples: List[torch.Tensor] = []
         for _ in range(self.n_train_ens):
-            xt_s, ts, tes, dens, _ = self._cfm_noisy(x1)
+            xt_s, ts, _, dens, _ = self._cfm_noisy(x1)
             pv_s = self.net(xt_s, ts, batch_list)
             x1_s = xt_s + dens * pv_s
             pa_s, _ = self._to_abs(x1_s, lp, lm)
             samples.append(pa_s)
-        pred_samples = torch.stack(samples)          # [M, T, B, 2]
+        pred_samples = torch.stack(samples)   # [M, T, B, 2]
 
         x1_pred = x_t + denom * pred_vel
-        pred_abs, _ = self._to_abs(x1_pred, lp, lm)
+        pred_abs, _ = self._to_abs(x1_pred, lp, lm)  # [T_pred, B, 2]
 
         return compute_total_loss(
             pred_abs     = pred_abs,
@@ -828,8 +816,8 @@ class TCFlowMatching(nn.Module):
         Me_mean    : [T, B, 2]    ensemble mean intensity
         all_trajs  : [S, T, B, 2] all ensemble members (for CRPS)
         """
-        lp  = batch_list[0][-1]   # [B, 2]
-        lm  = batch_list[7][-1]
+        lp  = batch_list[0][-1]  # [B, 2]  last observed position
+        lm  = batch_list[7][-1]  # [B, 2]  last observed Me
         B, device = lp.shape[0], lp.device
         dt  = 1.0 / ddim_steps
 
@@ -841,12 +829,13 @@ class TCFlowMatching(nn.Module):
             for step in range(ddim_steps):
                 t_b = torch.full((B,), step * dt, device=device)
                 x_t = x_t + dt * self.net(x_t, t_b, batch_list)
+                # Soft clamp: prevents extreme runaway predictions
                 x_t[:, :, :2].clamp_(-5.0, 5.0)
             tr, me = self._to_abs(x_t, lp, lm)
             traj_s.append(tr)
             me_s.append(me)
 
-        all_trajs = torch.stack(traj_s)    # [S, T, B, 2]
+        all_trajs = torch.stack(traj_s)   # [S, T, B, 2]
         all_me    = torch.stack(me_s)
         traj_mean = all_trajs.mean(0)
         me_mean   = all_me.mean(0)
@@ -870,34 +859,38 @@ class TCFlowMatching(nn.Module):
         T, B, _ = traj_mean.shape
         S       = all_trajs.shape[0]
 
+        # Denormalise to degrees
         mean_lon = (traj_mean[..., 0] * 5.0 + 180.0).cpu().numpy()
         mean_lat = (traj_mean[..., 1] * 5.0).cpu().numpy()
         all_lon  = (all_trajs[..., 0] * 5.0 + 180.0).cpu().numpy()
         all_lat  = (all_trajs[..., 1] * 5.0).cpu().numpy()
 
-        fields = ["timestamp","batch_idx","step_idx","lead_h",
-                  "lon_mean_deg","lat_mean_deg",
-                  "lon_std_deg","lat_std_deg","ens_spread_km"]
+        fields = ["timestamp", "batch_idx", "step_idx", "lead_h",
+                  "lon_mean_deg", "lat_mean_deg",
+                  "lon_std_deg", "lat_std_deg", "ens_spread_km"]
         write_hdr = not os.path.exists(csv_path)
         with open(csv_path, "a", newline="") as fh:
             w = csv.DictWriter(fh, fieldnames=fields)
-            if write_hdr: w.writeheader()
+            if write_hdr:
+                w.writeheader()
             for b in range(B):
                 for k in range(T):
                     dlat  = all_lat[:, k, b] - mean_lat[k, b]
                     dlon  = (all_lon[:, k, b] - mean_lon[k, b]) * math.cos(
                         math.radians(mean_lat[k, b]))
-                    spread = float(np.sqrt((dlat**2 + dlon**2).mean()) * 111.0)
+                    spread = float(np.sqrt((dlat ** 2 + dlon ** 2).mean()) * 111.0)
                     w.writerow(dict(
-                        timestamp    = ts, batch_idx = b,
-                        step_idx     = k,  lead_h    = (k+1)*6,
-                        lon_mean_deg = f"{mean_lon[k,b]:.4f}",
-                        lat_mean_deg = f"{mean_lat[k,b]:.4f}",
-                        lon_std_deg  = f"{all_lon[:,k,b].std():.4f}",
-                        lat_std_deg  = f"{all_lat[:,k,b].std():.4f}",
-                        ens_spread_km= f"{spread:.2f}",
+                        timestamp     = ts,
+                        batch_idx     = b,
+                        step_idx      = k,
+                        lead_h        = (k + 1) * 6,
+                        lon_mean_deg  = f"{mean_lon[k,b]:.4f}",
+                        lat_mean_deg  = f"{mean_lat[k,b]:.4f}",
+                        lon_std_deg   = f"{all_lon[:,k,b].std():.4f}",
+                        lat_std_deg   = f"{all_lat[:,k,b].std():.4f}",
+                        ens_spread_km = f"{spread:.2f}",
                     ))
-        print(f"  📍  Predictions → {csv_path}  (B={B}, T={T}, S={S})")
+        print(f"  Predictions → {csv_path}  (B={B}, T={T}, S={S})")
 
 
 # Backward-compat alias
