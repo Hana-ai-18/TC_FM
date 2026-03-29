@@ -129,13 +129,7 @@ def _find_tcnd_root(path: str) -> str:
     return path
 
 
-def data_loader(
-    args,
-    path_config,
-    test:      bool     = False,
-    test_year: int | None = None,
-    batch_size: int | None = None,
-) -> tuple:
+
     """
     Create a DataLoader for the given split.
 
@@ -151,6 +145,14 @@ def data_loader(
     -------
     (dataset, loader)
     """
+def data_loader(
+    args,
+    path_config,
+    test:      bool     = False,
+    test_year: int | None = None,
+    batch_size: int | None = None,
+) -> tuple:
+
     if isinstance(path_config, dict):
         raw_path  = path_config.get("root", "")
         dset_type = path_config.get("type", "test" if test else "train")

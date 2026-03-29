@@ -1573,8 +1573,9 @@ class TrajectoryDataset(Dataset):
         else:
             root  = data_dir
             dtype = type
-        if is_test:
-            dtype = "test"
+        if is_test and dtype not in ("val", "test"):
+            dtype = "test"   # chỉ override nếu chưa được set rõ ràng
+
 
         root = os.path.abspath(root)
         bn   = os.path.basename(root)
