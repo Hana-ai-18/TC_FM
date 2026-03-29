@@ -756,7 +756,7 @@ def main(args):
     warmup      = len(train_loader) * args.warmup_epochs // max(args.grad_accum, 1)
     scheduler   = get_cosine_schedule_with_warmup(optimizer, warmup, total_steps)
     saver       = BestModelSaver(patience=args.patience)
-    scaler      = GradScaler(enabled=args.use_amp)
+    scaler = torch.amp.GradScaler('cuda', enabled=args.use_amp)
 
     # ── Training loop ──────────────────────────────────────────────────────
     print("=" * 68)
@@ -813,7 +813,7 @@ def main(args):
         with torch.no_grad():
             for batch in val_loader:
                 bl_v = move(list(batch), device)
-                with autocast(enabled=args.use_amp):
+                with autocast(device_type='cuda', enabled=args.use_amp):
                     val_loss += model.get_loss(bl_v).item()
         avg_v = val_loss / len(val_loader)
 
