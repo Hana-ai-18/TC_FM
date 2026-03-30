@@ -258,7 +258,8 @@ def data_loader(args, path, test=False, batch_size=None):
         batch_size=batch_size or args.batch_size,
         shuffle=not test,
         collate_fn=seq_collate_training,
-        num_workers=0,
+        num_workers=4,
+        pin_memory=True, 
         drop_last=True
     )
     
