@@ -471,28 +471,18 @@
 #     if torch.cuda.is_available():
 #         torch.cuda.manual_seed_all(42)
 #     main(args)
-
 """
-scripts/train_flowmatching.py  ── v9-fixed
-============================================
+scripts/train_flowmatching.py  ── v9-fixed (patched)
+=====================================================
 Training script for TCFlowMatching v9.
 
-Kaggle + Google Drive usage:
-    # Mount Drive in Colab/Kaggle notebook first:
-    #   from google.colab import drive; drive.mount('/content/drive')
-    # Then:
-    python scripts/train_flowmatching.py \
-        --dataset_root /content/drive/MyDrive/TCND_vn \
-        --output_dir   /kaggle/working/runs/v9 \
-        --use_amp \
-        --num_epochs 200 --batch_size 32
-
-    # Pure Kaggle input:
-    python scripts/train_flowmatching.py \
-        --dataset_root /kaggle/input/tcnd-vn/TCND_vn \
-        --output_dir   /kaggle/working/runs/v9 \
-        --use_amp \
-        --num_epochs 200 --batch_size 32
+Fixes applied:
+  1. Duplicate --val_ensemble argparse argument removed
+  2. Model init moved BEFORE the epoch loop that references it
+  3. n_train_ens default changed None → 4 (avoid NoneType error in range())
+  4. DataLoader num_workers=0 on Kaggle (persistent_workers only if workers>0)
+  5. autocast device_type unified to 'cuda'
+  6. scheduler.step() called correctly (after scaler.step)
 """
 from __future__ import annotations
 
@@ -507,7 +497,6 @@ import math
 import numpy as np
 import torch
 import torch.optim as optim
-# from torch.cuda.amp import GradScaler, autocast
 from torch.cuda.amp import GradScaler
 from torch.amp import autocast
 
@@ -532,12 +521,14 @@ from scripts.statistical_tests import run_all_tests
 
 def get_args():
     p = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    # Data
+
+    # ── Data ──────────────────────────────────────────────────────────────
     p.add_argument("--dataset_root",    default="TCND_vn",  type=str)
     p.add_argument("--obs_len",         default=8,          type=int)
     p.add_argument("--pred_len",        default=12,         type=int)
     p.add_argument("--test_year",       default=None,       type=int)
-    # Training
+
+    # ── Training ──────────────────────────────────────────────────────────
     p.add_argument("--batch_size",      default=32,         type=int)
     p.add_argument("--num_epochs",      default=200,        type=int)
     p.add_argument("--g_learning_rate", default=2e-4,       type=float)
@@ -547,35 +538,42 @@ def get_args():
     p.add_argument("--grad_accum",      default=1,          type=int,
                    help="Gradient accumulation steps (helps on small GPU)")
     p.add_argument("--patience",        default=40,         type=int)
-    p.add_argument("--n_train_ens",     default=None,          type=int,
-                   help="Ensemble size for afCRPS during training")
+    # FIX: default None → 4 để tránh lỗi range(None) trong get_loss_breakdown
+    p.add_argument("--n_train_ens",     default=4,          type=int,
+                   help="Ensemble size for afCRPS during training (1=fast, 4=default)")
     p.add_argument("--use_amp",         action="store_true",
                    help="Mixed precision (faster on GPU)")
+    # FIX: default 0 cho Kaggle/Colab stability
     p.add_argument("--num_workers",     default=0,          type=int,
-                   help="DataLoader workers (0 = Kaggle-safe)")
-    # Model
+                   help="DataLoader workers (0 = Kaggle-safe, 2 = local SSD)")
+
+    # ── Model ──────────────────────────────────────────────────────────────
     p.add_argument("--sigma_min",       default=0.02,       type=float)
     p.add_argument("--ode_steps",       default=10,         type=int)
-    p.add_argument("--val_ensemble",    default=50,         type=int,
-                   help="Use 10 for fast dev runs, 50 for final eval")
-    # Logging
+    # FIX: --val_ensemble chỉ khai báo MỘT lần, default=10 cho training
+    p.add_argument("--val_ensemble",    default=10,         type=int,
+                   help="Ensemble size for validation (10=fast train, 50=final eval)")
+
+    # ── Validation frequency ───────────────────────────────────────────────
+    p.add_argument("--val_freq",        default=10,         type=int,
+                   help="Run fast val every N epochs")
+    p.add_argument("--full_eval_freq",  default=50,         type=int,
+                   help="Run full ensemble eval every N epochs")
+
+    # ── Logging ────────────────────────────────────────────────────────────
     p.add_argument("--output_dir",      default="runs/v9",  type=str)
     p.add_argument("--save_interval",   default=10,         type=int)
-    # Trong get_args():
-    p.add_argument("--val_freq",       default=10,  type=int)   # từ 5 → 10
-    p.add_argument("--full_eval_freq", default=50,  type=int)   # từ 20 → 50
-    p.add_argument("--val_ensemble",   default=10,  type=int)   # từ 50 → 10 khi train
-
-# Chỉ dùng ensemble lớn ở final test, không phải validation
     p.add_argument("--metrics_csv",     default="metrics.csv",     type=str)
     p.add_argument("--predict_csv",     default="predictions.csv", type=str)
     p.add_argument("--gpu_num",         default="0",        type=str)
-    # Dataset compat
+
+    # ── Dataset compat ────────────────────────────────────────────────────
     p.add_argument("--delim",           default=" ")
     p.add_argument("--skip",            default=1,          type=int)
     p.add_argument("--min_ped",         default=1,          type=int)
     p.add_argument("--threshold",       default=0.002,      type=float)
     p.add_argument("--other_modal",     default="gph")
+
     return p.parse_args()
 
 
@@ -679,7 +677,7 @@ class BestModelSaver:
                 val_ade_km       = ade,
                 model_version    = "v9-fixed",
             ), os.path.join(out_dir, "best_model.pth"))
-            print(f"  Best ADE {ade:.1f} km  (epoch {epoch})")
+            print(f"  ✅ Best ADE {ade:.1f} km  (epoch {epoch})")
         else:
             self.counter += 1
             print(f"  No improvement {self.counter}/{self.patience}")
@@ -713,33 +711,31 @@ def main(args):
     print(f"  use_amp      : {args.use_amp}")
     print(f"  grad_accum   : {args.grad_accum}")
     print(f"  num_workers  : {args.num_workers}")
+    print(f"  n_train_ens  : {args.n_train_ens}")
+    print(f"  val_ensemble : {args.val_ensemble}")
 
-    # ── Data ──────────────────────────────────────────────────────────────
     # ── Data ──────────────────────────────────────────────────────────────
     _, train_loader = data_loader(
         args, {"root": args.dataset_root, "type": "train"}, test=False)
-    
+
     _, val_loader = data_loader(
-        args, {"root": args.dataset_root, "type": "val"}, test=True)  # ← luôn dùng val/
+        args, {"root": args.dataset_root, "type": "val"}, test=True)
 
     test_loader = None
     try:
         _, test_loader = data_loader(
             args, {"root": args.dataset_root, "type": "test"},
-            test=True, test_year=None)   # ← None: lấy toàn bộ test/
+            test=True, test_year=None)
     except Exception as e:
         print(f"  Warning: test loader failed: {e}")
 
     print(f"  train : {len(train_loader.dataset)} seq")
     print(f"  val   : {len(val_loader.dataset)} seq")
     if test_loader:
-        print(f"  test  : {len(test_loader.dataset)} seq ")
+        print(f"  test  : {len(test_loader.dataset)} seq")
 
-    for epoch in range(args.num_epochs):
-    # Giai đoạn đầu: train nhanh với ens nhỏ
-        current_ens = 1 if epoch < 30 else (2 if epoch < 80 else args.n_train_ens)
-        model.n_train_ens = current_ens
     # ── Model ──────────────────────────────────────────────────────────────
+    # FIX: Model phải được khởi tạo TRƯỚC vòng lặp epoch
     model = TCFlowMatching(
         pred_len    = args.pred_len,
         obs_len     = args.obs_len,
@@ -764,6 +760,8 @@ def main(args):
     warmup      = len(train_loader) * args.warmup_epochs // max(args.grad_accum, 1)
     scheduler   = get_cosine_schedule_with_warmup(optimizer, warmup, total_steps)
     saver       = BestModelSaver(patience=args.patience)
+
+    # FIX: GradScaler API thống nhất
     scaler = torch.amp.GradScaler('cuda', enabled=args.use_amp)
 
     # ── Training loop ──────────────────────────────────────────────────────
@@ -775,6 +773,18 @@ def main(args):
     train_start = time.perf_counter()
 
     for epoch in range(args.num_epochs):
+        # FIX: Điều chỉnh n_train_ens theo epoch để tăng tốc giai đoạn đầu
+        # Giai đoạn 1 (epoch 0-29)  : ens=1 — train nhanh nhất
+        # Giai đoạn 2 (epoch 30-79) : ens=2 — bắt đầu học diversity
+        # Giai đoạn 3 (epoch 80+)   : ens=args.n_train_ens — full quality
+        if epoch < 30:
+            current_ens = 1
+        elif epoch < 80:
+            current_ens = 2
+        else:
+            current_ens = args.n_train_ens
+        model.n_train_ens = current_ens
+
         model.train()
         sum_loss  = 0.0
         sum_parts = {k: 0.0 for k in ("fm", "dir", "step", "disp", "heading", "smooth", "pinn")}
@@ -784,7 +794,8 @@ def main(args):
         for i, batch in enumerate(train_loader):
             bl = move(list(batch), device)
 
-            with autocast("cuda", enabled=args.use_amp):
+            # FIX: device_type='cuda' thống nhất (tránh warning với torch >= 2.0)
+            with autocast(device_type='cuda', enabled=args.use_amp):
                 bd = model.get_loss_breakdown(bl)
 
             scaler.scale(bd["total"] / max(args.grad_accum, 1)).backward()
@@ -792,9 +803,9 @@ def main(args):
             if (i + 1) % max(args.grad_accum, 1) == 0:
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-                scaler.step(optimizer)   # ← optimizer.step() TRƯỚC
+                scaler.step(optimizer)   # optimizer.step() trước
                 scaler.update()
-                scheduler.step()         # ← scheduler.step() SAU
+                scheduler.step()         # scheduler.step() sau
                 optimizer.zero_grad()
 
             sum_loss += bd["total"].item()
@@ -808,6 +819,7 @@ def main(args):
                       f"  fm={bd.get('fm',0):.3f}"
                       f"  heading={bd.get('heading',0):.3f}"
                       f"  pinn={bd.get('pinn',0):.4f}"
+                      f"  ens={current_ens}"
                       f"  lr={lr:.2e}")
 
         ep_s  = time.perf_counter() - t0
@@ -815,7 +827,7 @@ def main(args):
         n     = len(train_loader)
         avg_t = sum_loss / n
 
-        # Validation loss
+        # ── Validation loss ──────────────────────────────────────────────
         model.eval()
         val_loss = 0.0
         with torch.no_grad():
@@ -825,7 +837,7 @@ def main(args):
                     val_loss += model.get_loss(bl_v).item()
         avg_v = val_loss / len(val_loader)
 
-        # Val ADE check (fast, single sample)
+        # ── Fast val ADE (single sample) ─────────────────────────────────
         if epoch % args.val_freq == 0 or epoch < 3:
             m = evaluate_fast(model, val_loader, device, args.ode_steps, args.pred_len)
             print(f"\n{'─'*60}  Epoch {epoch:>3}")
@@ -834,7 +846,7 @@ def main(args):
                   f"72h={m.get('72h', 0):.0f} km\n")
             saver(m["ADE"], model, args.output_dir, epoch, optimizer, avg_t, avg_v)
 
-        # Full eval with ensemble (slow — use val_ensemble=10 for dev)
+        # ── Full eval với ensemble (chậm) ────────────────────────────────
         if epoch % args.full_eval_freq == 0 and epoch > 0:
             print(f"  [Full eval epoch {epoch}]")
             dm, _, _, _ = evaluate_full(
@@ -844,7 +856,7 @@ def main(args):
             )
             print(dm.summary())
 
-        # Periodic checkpoint
+        # ── Periodic checkpoint ───────────────────────────────────────────
         if (epoch + 1) % args.save_interval == 0:
             cp = os.path.join(args.output_dir, f"ckpt_ep{epoch:03d}.pth")
             torch.save({"epoch": epoch, "model_state_dict": model.state_dict()}, cp)
@@ -868,11 +880,13 @@ def main(args):
             except Exception:
                 model.load_state_dict(ck["model_state_dict"], strict=False)
             print(f"  Loaded best @ epoch {ck.get('epoch','?')}"
-                  f"  (ADE={ck.get('val_ade_km','?'):.1f} km)")
+                  f"  (ADE={ck.get('val_ade_km', '?')})")
 
+        # FIX: dùng val_ensemble lớn hơn cho final test (có thể override thủ công)
+        final_ens = max(args.val_ensemble, 50)
         dm_test, obs_seqs, gt_seqs, pred_seqs = evaluate_full(
             model, test_loader, device,
-            args.ode_steps, args.pred_len, args.val_ensemble,
+            args.ode_steps, args.pred_len, final_ens,
             metrics_csv=metrics_csv, tag="test_final",
             predict_csv=predict_csv,
         )
@@ -912,11 +926,11 @@ def main(args):
             for p, g in zip(pred_seqs, gt_seqs)
         ])
 
-        # Placeholder baselines (replace with real model runs)
+        # Placeholder baselines (replace với real model runs)
         lstm_per_seq      = cliper_errs.mean(1) * 0.82
         diffusion_per_seq = cliper_errs.mean(1) * 0.70
 
-        # Save error arrays for external use
+        # Save error arrays
         np.save(os.path.join(stat_dir, "fmpinn.npy"),      fmpinn_per_seq)
         np.save(os.path.join(stat_dir, "cliper.npy"),      cliper_errs.mean(1))
         np.save(os.path.join(stat_dir, "persistence.npy"), persist_errs.mean(1))
