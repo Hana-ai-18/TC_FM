@@ -70,31 +70,19 @@
 
 #     print(f"  ✅  {len(dataset)} sequences")
 #     return dataset, loader
-
 """
-TCNM/data/loader.py  ── v9-fixed
-==================================
+TCNM/data/loader.py  ── v9-fixed (patched)
+============================================
 Smart data loader — resolves TCND_vn root automatically.
-Compatible with Kaggle (Google Drive mount) and local paths.
 
-Kaggle + Drive usage:
-    from google.colab import drive
-    drive.mount('/content/drive')
-
-    # In train script:
-    --dataset_root /content/drive/MyDrive/TCND_vn
-
-    # Or pure Kaggle input:
-    --dataset_root /kaggle/input/tcnd-vn/TCND_vn
-
-The loader walks up the directory tree to find the folder containing Data1d/.
+FIX: persistent_workers=True chỉ được set khi num_workers > 0.
+     Trên Kaggle dùng num_workers=0 (default) để tránh deadlock.
 """
 from __future__ import annotations
 
 import os
 import sys
 
-# Ensure project root is on path regardless of working directory
 _here = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 if _here not in sys.path:
     sys.path.insert(0, _here)
@@ -105,10 +93,7 @@ from TCNM.data.trajectoriesWithMe_unet_training import TrajectoryDataset, seq_co
 
 
 def _find_tcnd_root(path: str) -> str:
-    """
-    Walk up the directory tree to find the folder containing Data1d/.
-    Also checks common sub-folder names used in Kaggle/Drive setups.
-    """
+    """Walk up the directory tree to find the folder containing Data1d/."""
     path  = os.path.abspath(path)
     check = path
     for _ in range(6):
@@ -119,17 +104,21 @@ def _find_tcnd_root(path: str) -> str:
             break
         check = parent
 
-    # Try common sub-folder names
     for sub in ("TCND_vn", "tcnd_vn", "data", "TCND"):
         candidate = os.path.join(path, sub)
         if os.path.exists(os.path.join(candidate, "Data1d")):
             return candidate
 
-    # Fallback: use path as-is (will raise clear error from dataset)
     return path
 
 
-
+def data_loader(
+    args,
+    path_config,
+    test:       bool      = False,
+    test_year:  int | None = None,
+    batch_size: int | None = None,
+) -> tuple:
     """
     Create a DataLoader for the given split.
 
@@ -137,7 +126,7 @@ def _find_tcnd_root(path: str) -> str:
     ----------
     args        : argparse Namespace with obs_len, pred_len, batch_size, etc.
     path_config : str | dict — {'root': ..., 'type': 'train'|'val'|'test'}
-    test        : bool — if True, shuffle=False and dtype defaults to 'test'
+    test        : bool — if True, shuffle=False
     test_year   : int | None — filter Data1d files by year string
     batch_size  : override args.batch_size if provided
 
@@ -145,14 +134,6 @@ def _find_tcnd_root(path: str) -> str:
     -------
     (dataset, loader)
     """
-def data_loader(
-    args,
-    path_config,
-    test:      bool     = False,
-    test_year: int | None = None,
-    batch_size: int | None = None,
-) -> tuple:
-
     if isinstance(path_config, dict):
         raw_path  = path_config.get("root", "")
         dset_type = path_config.get("type", "test" if test else "train")
@@ -177,22 +158,25 @@ def data_loader(
         is_test     = test,
     )
 
-    # num_workers: 0 for Kaggle/Colab stability; increase locally if fast SSD
+    # FIX: num_workers mặc định 0 (Kaggle-safe)
+    # persistent_workers và prefetch_factor CHỈ dùng khi num_workers > 0
     num_workers = getattr(args, "num_workers", 0)
+    use_persistent = num_workers > 0
+    prefetch       = 2 if num_workers > 0 else None
 
     loader = DataLoader(
-    dataset,
-    batch_size  = batch_size or args.batch_size,
-    shuffle     = not test,
-    collate_fn  = seq_collate,
-    num_workers = 2,          # ← Kaggle cho phép 2, thử 4 nếu P100
-    persistent_workers = True, # ← tái sử dụng workers giữa epoch
-    prefetch_factor = 2,
-    drop_last   = False,
-    pin_memory  = _cuda_available(),
-)
+        dataset,
+        batch_size         = batch_size or args.batch_size,
+        shuffle            = not test,
+        collate_fn         = seq_collate,
+        num_workers        = num_workers,
+        persistent_workers = use_persistent,   # FIX: False khi num_workers=0
+        prefetch_factor    = prefetch,         # FIX: None khi num_workers=0
+        drop_last          = False,
+        pin_memory         = _cuda_available() and num_workers > 0,
+    )
 
-    print(f"  {len(dataset)} sequences loaded")
+    print(f"  {len(dataset)} sequences loaded  (workers={num_workers})")
     return dataset, loader
 
 
