@@ -181,14 +181,16 @@ def data_loader(
     num_workers = getattr(args, "num_workers", 0)
 
     loader = DataLoader(
-        dataset,
-        batch_size  = batch_size or args.batch_size,
-        shuffle     = not test,
-        collate_fn  = seq_collate,
-        num_workers = num_workers,
-        drop_last   = False,
-        pin_memory  = _cuda_available(),
-    )
+    dataset,
+    batch_size  = batch_size or args.batch_size,
+    shuffle     = not test,
+    collate_fn  = seq_collate,
+    num_workers = 2,          # ← Kaggle cho phép 2, thử 4 nếu P100
+    persistent_workers = True, # ← tái sử dụng workers giữa epoch
+    prefetch_factor = 2,
+    drop_last   = False,
+    pin_memory  = _cuda_available(),
+)
 
     print(f"  {len(dataset)} sequences loaded")
     return dataset, loader

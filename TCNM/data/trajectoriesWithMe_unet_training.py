@@ -1634,6 +1634,7 @@ class TrajectoryDataset(Dataset):
         self.non_linear_ped  = []
         self.tyID            = []
         num_peds_in_seq      = []
+        self.env_cache = {}
 
         for path in all_files:
             base  = os.path.splitext(os.path.basename(path))[0]
@@ -1995,8 +1996,10 @@ class TrajectoryDataset(Dataset):
         # ── Env features ──────────────────────────────────────────────────
         obs_traj_np = obs_traj[0].numpy()   # [2, T_obs]  first ped (all same storm)
         obs_Me_np   = obs_Me[0].numpy()     # [2, T_obs]
-        env_out = self._get_env_features(
-            year, tyname, dates[:self.obs_len], obs_traj_np, obs_Me_np)
+        if index not in self.env_cache:
+            self.env_cache[index] = self._get_env_features(
+                year, tyname, dates[:self.obs_len], obs_traj_np, obs_Me_np)
+        env_out = self.env_cache[index]
 
         return [
             obs_traj,                              # 0  [n_ped, 2, T_obs]

@@ -547,7 +547,7 @@ def get_args():
     p.add_argument("--grad_accum",      default=1,          type=int,
                    help="Gradient accumulation steps (helps on small GPU)")
     p.add_argument("--patience",        default=40,         type=int)
-    p.add_argument("--n_train_ens",     default=4,          type=int,
+    p.add_argument("--n_train_ens",     default=None,          type=int,
                    help="Ensemble size for afCRPS during training")
     p.add_argument("--use_amp",         action="store_true",
                    help="Mixed precision (faster on GPU)")
@@ -561,8 +561,12 @@ def get_args():
     # Logging
     p.add_argument("--output_dir",      default="runs/v9",  type=str)
     p.add_argument("--save_interval",   default=10,         type=int)
-    p.add_argument("--val_freq",        default=5,          type=int)
-    p.add_argument("--full_eval_freq",  default=20,         type=int)
+    # Trong get_args():
+    p.add_argument("--val_freq",       default=10,  type=int)   # từ 5 → 10
+    p.add_argument("--full_eval_freq", default=50,  type=int)   # từ 20 → 50
+    p.add_argument("--val_ensemble",   default=10,  type=int)   # từ 50 → 10 khi train
+
+# Chỉ dùng ensemble lớn ở final test, không phải validation
     p.add_argument("--metrics_csv",     default="metrics.csv",     type=str)
     p.add_argument("--predict_csv",     default="predictions.csv", type=str)
     p.add_argument("--gpu_num",         default="0",        type=str)
@@ -731,6 +735,10 @@ def main(args):
     if test_loader:
         print(f"  test  : {len(test_loader.dataset)} seq ")
 
+    for epoch in range(args.num_epochs):
+    # Giai đoạn đầu: train nhanh với ens nhỏ
+        current_ens = 1 if epoch < 30 else (2 if epoch < 80 else args.n_train_ens)
+        model.n_train_ens = current_ens
     # ── Model ──────────────────────────────────────────────────────────────
     model = TCFlowMatching(
         pred_len    = args.pred_len,

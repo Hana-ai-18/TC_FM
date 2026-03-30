@@ -669,7 +669,14 @@ class VelocityField(nn.Module):
         out = self.transformer(x_emb, memory)
         return self.out_fc2(F.gelu(self.out_fc1(out)))  # [B, T_pred, 4]
 
-
+    def forward_with_ctx(self, x_t, t, ctx):
+        """Forward pass dùng context đã tính sẵn, bỏ qua UNet."""
+        t_emb = F.gelu(self.time_fc1(self._time_emb(t)))
+        t_emb = self.time_fc2(t_emb)
+        x_emb  = self.traj_embed(x_t) + self.pos_enc + t_emb.unsqueeze(1)
+        memory = torch.cat([t_emb.unsqueeze(1), ctx.unsqueeze(1)], dim=1)
+        out = self.transformer(x_emb, memory)
+        return self.out_fc2(F.gelu(self.out_fc1(out)))
 # ══════════════════════════════════════════════════════════════════════════════
 #  TCFlowMatching
 # ══════════════════════════════════════════════════════════════════════════════
@@ -772,14 +779,17 @@ class TCFlowMatching(nn.Module):
         lp, lm = obs_t[-1], obs_Me[-1]               # [B, 2]
         x1 = self._to_rel(traj_gt, Me_gt, lp, lm)   # [B, T_pred, 4]
 
-        x_t, t, te, denom, _ = self._cfm_noisy(x1)
-        pred_vel = self.net(x_t, t, batch_list)
 
         # Ensemble samples for afCRPS
         samples: List[torch.Tensor] = []
+        ctx = self.net._context(batch_list)  # UNet chỉ chạy 1 lần
+    
+        x_t, t, te, denom, _ = self._cfm_noisy(x1)
+        pred_vel = self.net.forward_with_ctx(x_t, t, ctx)  # không gọi UNet lại
+        
         for _ in range(self.n_train_ens):
             xt_s, ts, _, dens, _ = self._cfm_noisy(x1)
-            pv_s = self.net(xt_s, ts, batch_list)
+            pv_s = self.net.forward_with_ctx(xt_s, ts, ctx)  # tái dùng ctx
             x1_s = xt_s + dens * pv_s
             pa_s, _ = self._to_abs(x1_s, lp, lm)
             samples.append(pa_s)
